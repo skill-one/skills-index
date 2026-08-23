@@ -2,7 +2,9 @@ name: daily-sync
 
 # Generate the skills index and publish `data/` as a GitHub Release.
 # Data is never committed to the main branch (see .gitignore); each run is a
-# self-contained snapshot uploaded as Release assets.
+# self-contained snapshot uploaded as Release assets. On main, index.jsonl is
+# additionally force-pushed to the orphan `dist` branch so CDN proxies with
+# CORS headers (jsDelivr and mirrors) can serve it to browsers.
 #
 # Triggers:
 #   - Daily at 00:00 UTC (full refresh on `main`).
@@ -138,6 +140,27 @@ jobs:
             data/scanned-repos-by-stars.jsonl
             data/scanned-repos-by-skillcount.jsonl
             data/run-summary.md
+
+      # Single-snapshot orphan branch (force-pushed, no history accumulation):
+      # makes index.jsonl addressable as a normal git file so CORS-enabled CDN
+      # proxies (cdn.jsdelivr.net / cdn.jsdmirror.com /gh/...@dist/...) can
+      # serve it — release assets are not proxyable. Main only, so smoke runs
+      # on `test` never overwrite the published index.
+      - name: Publish index.jsonl to dist branch (CDN-accessible)
+        if: github.ref_name == 'main'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/dist" && mkdir -p "$RUNNER_TEMP/dist" && cd "$RUNNER_TEMP/dist"
+          git init -b dist
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp "$GITHUB_WORKSPACE/data/index.jsonl" .
+          git add index.jsonl
+          git commit -m "index snapshot ${{ steps.scope.outputs.ts }}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin dist
 
       # Prune only on main, so test smoke runs don't consume the retention quota.
       - name: Prune old releases
