@@ -84,7 +84,7 @@ def test_run_index_keeps_fetched_order(tmp_path: Path, monkeypatch: pytest.Monke
 def test_run_index_includes_scan_only_skills(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """仓库有、榜单无的技能仍入索引，installs/weeklyInstalls 置空，追加在末尾。"""
+    """仓库有、榜单无的技能仍入索引，installs/weeklyInstalls 字段不出现，追加在末尾。"""
     fetched = [{"source": "owner/repo", "skillId": "a", "installs": 1}]
     scanned = {
         "owner__repo": [
@@ -100,9 +100,8 @@ def test_run_index_includes_scan_only_skills(
     assert records == [
         {"source": "owner/repo", "skillId": "a", "installs": 1,
          "weeklyInstalls": [], "path": "skills/a", "description": "A"},
-        {"source": "owner/repo", "skillId": "gh-only", "installs": 0,
-         "weeklyInstalls": [], "path": "skills/gh-only",
-         "description": "not on skills.sh"},
+        {"source": "owner/repo", "skillId": "gh-only",
+         "path": "skills/gh-only", "description": "not on skills.sh"},
     ]
     assert summary["scan_only"] == 1
     assert summary["index"] == 2
@@ -111,7 +110,7 @@ def test_run_index_includes_scan_only_skills(
 def test_run_index_empty_fetched_still_indexes_scanned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """fetched 数据缺失时仍以扫描为基准输出，元数据全部置空。"""
+    """fetched 数据缺失时仍以扫描为基准输出，installs/weeklyInstalls 字段不出现。"""
     fetched = []
     scanned = {"owner__repo": [{"path": "skills/a", "description": "A"}]}
     fetched_path, index_path, by_source = _setup_data(tmp_path, fetched=fetched, scanned=scanned)
@@ -120,8 +119,8 @@ def test_run_index_empty_fetched_still_indexes_scanned(
     records, summary = index_mod.run_index(base_dir=by_source)
 
     assert records == [
-        {"source": "owner/repo", "skillId": "a", "installs": 0,
-         "weeklyInstalls": [], "path": "skills/a", "description": "A"}
+        {"source": "owner/repo", "skillId": "a",
+         "path": "skills/a", "description": "A"}
     ]
     assert read_jsonl(index_path) == records
     assert summary["scan_only"] == 1

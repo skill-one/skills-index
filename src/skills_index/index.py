@@ -77,6 +77,13 @@ def _filled(rec: Record) -> Record:
     return rec
 
 
+def _strip_metadata(rec: Record) -> Record:
+    """scan-only 技能无 skills.sh 数据：installs / weeklyInstalls 字段不出现。"""
+    rec.pop("installs", None)
+    rec.pop("weeklyInstalls", None)
+    return rec
+
+
 def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, JSON]]:
     """Merge every repo's scanned skills with skills.sh metadata into index.jsonl.
 
@@ -85,7 +92,7 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
     - `fetched-skills.jsonl` provides the skills.sh metadata (installs /
       weeklyInstalls), joined on `source` + `skillId`. Scanned skills with no
       fetched counterpart ("scan-only", e.g. not registered on skills.sh) keep
-      empty metadata (`installs: 0`, `weeklyInstalls: []`).
+      the installs / weeklyInstalls fields absent.
     - fetched skills with no scanned counterpart (removed from the repo) are
       dropped: only skills a repo scan confirms belong in the index.
     - output order: skills with fetched data keep the skills.sh ranking order;
@@ -140,7 +147,7 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
     # skills are appended afterwards (repo-dir order, path order within repo).
     matched.sort(key=lambda t: t[0])
     result = [_ordered(_filled(rec)) for _, rec in matched]
-    result += [_ordered(_filled(rec)) for rec in scan_only]
+    result += [_ordered(_strip_metadata(rec)) for rec in scan_only]
     # 跨仓库重复（skillId + description 双匹配）只保留 installs 更高者。
     result, deduped = _dedup_skills(result)
     write_jsonl(INDEX_JSONL, result)
@@ -151,7 +158,7 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
     summary["index"] = len(result)
     msg = (
         f"[index] merged {len(matched)} scanned with skills.sh data, "
-        f"{len(scan_only)} scan-only (empty installs), "
+        f"{len(scan_only)} scan-only (no installs data), "
         f"dropped {summary['not_in_repo']} not-in-repo"
         + (f", deduped {deduped} cross-repo" if deduped else "")
         + f" -> {len(result)} in {INDEX_JSONL}"

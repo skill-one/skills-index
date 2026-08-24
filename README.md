@@ -137,7 +137,7 @@ curl -L -o index.jsonl \
 
 ### 3. 合并索引（`index`）
 
-- **极简说明**：以第 2 步扫描出的所有仓库技能（`scanned.jsonl`）为基准，按 `source` + `skillId`（从 `path` 末段推导）挂载第 1 步的 skills.sh 数据（`fetched-skills.jsonl`），生成最终索引 `data/index.jsonl`（以**技能**为单位平铺，每行一个完整技能记录，含 skills.sh 元信息 + 扫描得到的 `path` / `description`）。**所有扫描到的技能都会进入索引**：skills.sh 未收录的技能 `installs` 记为 `0`、`weeklyInstalls` 记为 `[]`，并追加在索引末尾（有榜单数据的按 skills.sh 排名顺序在前）；仅出现在 skills.sh、但仓库中已不存在（未被扫描到）的技能会被剔除，不会记录；同理，仓库已不存在（第 2 步 404 时已清理其数据）的仓库，其所有技能也不会进入索引。
+- **极简说明**：以第 2 步扫描出的所有仓库技能（`scanned.jsonl`）为基准，按 `source` + `skillId`（从 `path` 末段推导）挂载第 1 步的 skills.sh 数据（`fetched-skills.jsonl`），生成最终索引 `data/index.jsonl`（以**技能**为单位平铺，每行一个完整技能记录，含 skills.sh 元信息 + 扫描得到的 `path` / `description`）。**所有扫描到的技能都会进入索引**：skills.sh 未收录的技能记录数不变，只是其中的 `installs` / `weeklyInstalls` 字段**不出现**（无数据，而非 0 / 空数组），并追加在索引末尾（有榜单数据的按 skills.sh 排名顺序在前）；仅出现在 skills.sh、但仓库中已不存在（未被扫描到）的技能会被剔除，不会记录；同理，仓库已不存在（第 2 步 404 时已清理其数据）的仓库，其所有技能也不会进入索引。
 - **对应命令**：`uv run skills-index index`
 
 ```json
