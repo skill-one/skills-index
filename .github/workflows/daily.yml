@@ -34,7 +34,7 @@ permissions:
   contents: write
 
 env:
-  KEEP_RELEASES: "30"
+  KEEP_RELEASES: "10"
 
 jobs:
   build-and-publish:
