@@ -1,8 +1,10 @@
-# 过滤机制说明
+# Filtering Rules
 
-流水线的全部过滤规则，分三层：**仓库级**（整个仓库丢弃）、**仓库内 skill 级**（单个 SKILL.md 丢弃）、**索引合并级**（合并时剔除/去重）。实现位置以 `源文件::函数` 标注，配置项集中在 `src/skills_index/config.py`。
+English | [简体中文](FILTERING.zh-CN.md)
 
-## 总览
+All filtering rules of the pipeline, in three layers: **repo-level** (drop the whole repository), **in-repo skill-level** (drop a single SKILL.md), and **index-merge-level** (exclude/dedupe during the merge). Implementation locations are annotated as `file::function`, and the configuration lives in `src/skills_index/config.py`.
+
+## Overview
 
 ```
 skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ index.jsonl
@@ -10,127 +12,127 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
                              F3 F4 F5
 ```
 
-| 编号 | 过滤 | 位置 | 一句话规则 |
-| --- | --- | --- | --- |
-| F1 | 排行榜入口门槛 | `fetch` | 必须出现在 skills.sh all-time 榜单 |
-| F2 | 非 GitHub 源 | `fetch::filter_github` | source 不是 `owner/repo` 形式即丢弃 |
-| F3 | 仓库已不存在 | `scan::_scan_one_repo` | GitHub 404 → 删除该仓库全部缓存数据 |
-| F4 | 高技能数仓库 | `scan::_scan_one_repo` | skillCount > 500（聚合型仓库）→ 丢弃并墓碑化缓存 |
-| F5 | 内容指纹镜像去重 | `scan::_dedup_repos` | 整棵技能树 blob sha 全等 → 只留星数最高者 |
-| S1 | 文件名约定 | `github::_parse_tarball` | 只收集 `…/SKILL.md`，其余文件一律忽略 |
-| S2 | 内部路径过滤 | `config::is_internal_skill_path` | SKILL.md 位于仓库内部目录 → 丢弃 |
-| S3 | 非公开 frontmatter | `github::is_nonpublic_frontmatter` | 作者声明 hidden/private/… → 丢弃 |
-| I1 | 孤儿技能 | `index::run_index` | 仓库有、榜单无 → 保留，元数据置空（`installs: 0` / `weeklyInstalls: []`） |
-| I2 | 榜单失配 | `index::run_index` | 榜单有、仓库扫描没有 → 剔除 |
-| I3 | 跨仓库技能去重 | `index::_dedup_skills` | skillId + description 双匹配 → 保留 installs 最高者 |
+| ID  | Filter                          | Location                              | Rule in one line                                                                                              |
+| --- | ------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| F1  | Leaderboard entry gate          | `fetch`                               | Must appear on the skills.sh all-time leaderboard                                                             |
+| F2  | Non-GitHub source               | `fetch::filter_github`                | Drop unless source matches `owner/repo`                                                                       |
+| F3  | Repository gone                 | `scan::_scan_one_repo`                | GitHub 404 → drop all cached data for the repo                                                                |
+| F4  | High skill-count repos          | `scan::_scan_one_repo`                | skillCount > 500 (aggregator repos) → drop and tombstone the cache                                            |
+| F5  | Content-fingerprint mirror dedup | `scan::_dedup_repos`                 | Identical skill-tree blob shas → keep only the highest-starred one                                            |
+| S1  | Filename convention             | `github::_parse_tarball`              | Collect only `…/SKILL.md`; ignore every other file                                                            |
+| S2  | Internal path filter            | `config::is_internal_skill_path`      | SKILL.md sits in an internal directory → drop                                                                 |
+| S3  | Non-public frontmatter          | `github::is_nonpublic_frontmatter`    | Author declares hidden/private/… → drop                                                                       |
+| I1  | Orphan skills                   | `index::run_index`                    | In repo, not on leaderboard → keep, metadata blanked (`installs: 0` / `weeklyInstalls: []`)                   |
+| I2  | Leaderboard mismatch            | `index::run_index`                    | On leaderboard, absent from repo scan → drop                                                                  |
+| I3  | Cross-repo skill dedup          | `index::_dedup_skills`                | skillId + description both match → keep the one with the most installs                                        |
 
-最终索引以**仓库扫描为基准**：收录范围由扫描结果决定（扫描已过 F1–F5 / S1–S3），skills.sh 榜单只挂载 `installs` 等元数据，未收录技能以空元数据入索引（I1）；榜单有、仓库无的技能被 I2 剔除——索引中的每个技能都有当前真实存在的仓库路径背书。
-
----
-
-## 一、仓库级过滤
-
-### F1 排行榜入口门槛（隐式）
-
-`fetch` 只从 skills.sh `all-time` 榜单拉取，不在榜单的仓库不进流水线。无显式调节项。
-
-### F2 非 GitHub 源
-
-- **规则**：`fetch::filter_github` 用 `config::is_github_source`（正则 `^[^/\s]+/[^/\s]+$`）校验，非 `owner/repo` 形式整条丢弃。
-- **同时**：只保留 `KEEP_FIELDS`（`source` / `skillId` / `installs` / `weeklyInstalls`），不落盘任何 URL 字段。
-- **计数**：`dropped_non_github`。
-
-### F3 仓库已不存在（404）
-
-- **规则**：GitHub 返回 404（已删除/改名/转私有）→ 删除 `cache/by-source/<owner>__<repo>/` 全部缓存，仓库及其技能从索引消失。
-- **判定**：`github::_is_missing_repo` 沿异常链查 404，与网络错误/5xx/限流区分——后者只跳过本次，不删数据。
-- **计数**：`repos_gone`。
-
-### F4 高技能数仓库（聚合商过滤）
-
-- **规则**：`skillCount` > `MAX_SKILL_COUNT`（默认 **500**）→ 整仓库丢弃，缓存**墓碑化**（`scanned.jsonl` 删除，`meta.json` 保留 `pushedAt` + `skillCount`）：后续运行在仓库无新推送时免 tarball 直接跳过，有新推送（可能回到上限以内）则重新全量裁决。
-- **可调**：`--max-skill-count N` 覆盖，`0` 关闭。
-- **覆盖增量分支**：`pushed_at` 未变化的 `ok` 缓存仓库用缓存 `meta.json` 的 `skillCount` 复查，规则收紧后仍会被过滤（转为墓碑）。
-- **计数**：`repos_filtered` / `repos_filtered_high_skill`。
-
-### F5 内容指纹镜像去重
-
-- **规则**：`scan::_dedup_repos` 把每个仓库的 `{path: blob_sha}` 技能树序列化为指纹；指纹全等 = 未分叉镜像，组内只留星数最高者，其余**墓碑化**（`status: tombstoned`）：删除 `scanned.jsonl`、`meta.json` 改写为 `dedupedInto` 标记（含双方 `pushedAt` 快照），技能不再进入索引；后续运行两仓均无新推送时直接跳过该仓库（零网络请求），任一方有推送或胜者消失则重新扫描并重新裁决。
-- **边界**：`skillCount == 0` 的仓库无指纹，不参与去重。
-- **计数**：`repos_deduped`（仅本轮新去重的败者；墓碑跳过计入 `repos_skipped`，日志标记 `[dedup-skip]`）。
+The final index is **anchored on the repo scan**: inclusion is decided by the scan results (which have already passed F1–F5 / S1–S3); the skills.sh leaderboard only attaches metadata such as `installs`; skills absent from the leaderboard enter the index with empty metadata (I1); leaderboard entries missing from the repo scan are removed by I2 — every skill in the index is backed by a repository path that currently exists.
 
 ---
 
-## 二、仓库内 skill 级过滤
+## 1. Repo-level filters
 
-发生在 `github::_parse_tarball`，顺序即优先级 S1 → S2 → S3，任一命中即丢弃（S2/S3 共用计数 `skills_filtered_nonpublic`）。
+### F1 Leaderboard entry gate (implicit)
 
-### S1 文件名约定
+`fetch` pulls only from the skills.sh `all-time` leaderboard; repos absent from the leaderboard never enter the pipeline. No explicit knob.
 
-只收集路径以 `/SKILL.md` 结尾的文件（技能必须位于自己的目录内，如 `skills/foo/SKILL.md`）。仓库根级单独的 `SKILL.md` 有意不收集。
+### F2 Non-GitHub sources
 
-### S2 内部路径过滤（`config::is_internal_skill_path`）
+- **Rule**: `fetch::filter_github` validates with `config::is_github_source` (regex `^[^/\s]+/[^/\s]+$`) and drops any entry not in `owner/repo` form.
+- **Also**: only `KEEP_FIELDS` (`source` / `skillId` / `installs` / `weeklyInstalls`) are kept; no URL fields are ever persisted.
+- **Counter**: `dropped_non_github`.
 
-对 SKILL.md 所在目录检查，**整段精确比较、大小写不敏感**（`testing` ≠ `test`）：
+### F3 Repository gone (404)
 
-- **状态词（任意路径段，含技能目录名）**：`deprecated` / `hidden` / `private` / `internal` / `obsolete`（`SKILL_EXCLUDE_ANY_DIRS`）。
-- **结构词（仅中间目录段，不含最后一段）**：`test` / `tests` / `__tests__` / `spec` / `e2e` / `example` / `examples` / `sample` / `samples` / `demo` / `demos` / `fixture` / `fixtures` / `mock` / `mocks` / `stub` / `stubs` / `template` / `templates` / `scaffold` / `boilerplate` / `doc` / `docs` / `dist` / `build` / `out` / `node_modules` / `vendor` / `third_party`（`SKILL_EXCLUDE_DIRS`，最后一段是技能目录名故豁免）。
-- **隐藏目录（`.` 开头）**：默认排除；`.claude/skills/…`、`.agents/skills/…`、`.skills/…` 等公开技能标准位置豁免；`.github` 恒不豁免。
+- **Rule**: GitHub returns 404 (deleted/renamed/made private) → delete the entire `cache/by-source/<owner>__<repo>/` cache; the repo and its skills disappear from the index.
+- **Detection**: `github::_is_missing_repo` walks the exception chain for 404 and distinguishes it from network errors/5xx/rate limiting — those only skip the current run and never delete data.
+- **Counter**: `repos_gone`.
 
-### S3 非公开 frontmatter（`github::is_nonpublic_frontmatter`）
+### F4 High skill-count repos (aggregator filter)
 
-解析 SKILL.md 的 YAML frontmatter，以下情况丢弃：
+- **Rule**: `skillCount` > `MAX_SKILL_COUNT` (default **500**) → drop the whole repo and **tombstone** its cache (delete `scanned.jsonl`, keep `pushedAt` + `skillCount` in `meta.json`): later runs skip it without a tarball while the repo has no new push, and re-adjudicate fully once it does (it may have come back under the cap).
+- **Tunable**: override with `--max-skill-count N`; `0` disables.
+- **Covers the incremental branch**: `ok`-cached repos whose `pushed_at` hasn't changed are re-checked against the cached `meta.json` `skillCount`, so tightening the rule still filters them (converted to tombstones).
+- **Counter**: `repos_filtered` / `repos_filtered_high_skill`.
 
-- `public: false`；
-- 以下字段为真值（`true` / `yes` / `1` 等）：`deprecated` / `hidden` / `private` / `internal` / `obsolete`（`HIDDEN_FRONTMATTER_MARKERS`）。
+### F5 Content-fingerprint mirror dedup
 
-反例（均保留）：`hidden: false`、`public: true`、无相关字段、frontmatter 缺失或解析失败。
-
----
-
-## 三、索引合并级过滤（`index::run_index`）
-
-前两步产物按 `(source, skillId)` 连接（`skillId` 从 `path` 末段目录名推导），以扫描结果为基准。
-
-### I1 孤儿技能（仓库有、榜单无）→ 保留
-
-`(source, 目录名)` 不在 skills.sh 榜单 → 仍写入 index.jsonl，但 `installs` / `weeklyInstalls` 字段**不出现**，追加在末尾（有榜单数据的按排名在前）。计数：`scan_only`。
-
-### I2 榜单失配（榜单有、仓库无）→ 剔除
-
-榜单收录但仓库扫描找不到（已删除/改名/移走）→ 剔除，保证每个技能都有真实仓库路径背书。计数：`not_in_repo`。
-
-### I3 跨仓库技能去重（`index::_dedup_skills`）
-
-`skillId` 且 `description`（非空）完全一致 → 视为同一技能的镜像/拷贝，组内只保留 `installs` 最高者（相同则保留排名靠前者）。`description` 为空不参与去重。计数：`deduped_skills`。
+- **Rule**: `scan::_dedup_repos` serializes each repo's `{path: blob_sha}` skill tree into a fingerprint; identical fingerprints mean an un-forked mirror, and within a group only the highest-starred repo survives while the rest are **tombstoned** (`status: tombstoned`): `scanned.jsonl` is deleted and `meta.json` rewritten with a `dedupedInto` marker (including both sides' `pushedAt` snapshots); its skills no longer enter the index; later runs skip both repos outright while neither has a new push (zero network requests); if either side gets a push or the winner disappears, both are rescanned and re-adjudicated.
+- **Edge**: repos with `skillCount == 0` have no fingerprint and do not participate in dedup.
+- **Counter**: `repos_deduped` (only losers newly deduped this round; tombstone skips count toward `repos_skipped`, logged with the `[dedup-skip]` marker).
 
 ---
 
-## 四、配置项（`src/skills_index/config.py`）
+## 2. In-repo skill-level filters
 
-| 常量 | 默认值 | 作用 |
-| --- | --- | --- |
-| `MAX_SKILL_COUNT` | `500` | F4 上限；`--max-skill-count N` 覆盖，`0` 关闭 |
-| `SKILL_EXCLUDE_DIRS` | 结构词集合 | S2 中间目录段排除词 |
-| `SKILL_EXCLUDE_ANY_DIRS` | 状态词集合 | S2 任意段排除词（含技能名） |
-| `HIDDEN_FRONTMATTER_MARKERS` | 状态词元组 | S3 frontmatter 非公开标记 |
-| `SCHEMA_VERSION` | `5` | 过滤规则变更时递增 → 触发存量缓存一次性全量重扫 |
+These run in `github::_parse_tarball`; the order is the priority S1 → S2 → S3, and any hit drops the file (S2/S3 share the `skills_filtered_nonpublic` counter).
 
-> 修改任何过滤规则后应递增 `SCHEMA_VERSION`：增量模式下旧缓存按旧规则生成，只有版本号变化才会强制重建。
+### S1 Filename convention
 
-## 五、观测：run-summary 计数对照
+Collect only files whose path ends with `/SKILL.md` (a skill must live inside its own directory, e.g. `skills/foo/SKILL.md`). A lone `SKILL.md` at the repository root is deliberately not collected.
 
-每次 `update` 后 `data/run-summary.md` 的字段与规则的对应：
+### S2 Internal path filter (`config::is_internal_skill_path`)
 
-| run-summary 字段 | 对应过滤 |
-| --- | --- |
-| `dropped_non_github` | F2 |
-| `repos_gone` | F3 |
-| `repos_filtered` / `repos_filtered_high_skill` | F4 |
-| `repos_deduped` | F5（命中时才显示） |
-| `skills_filtered_nonpublic` | S2 + S3（本次实际解析 tarball 的量） |
-| `scan_only` | I1（保留计数，非过滤量） |
-| `not_in_repo` | I2 |
-| `deduped_skills` | I3（命中时才显示） |
+Checks the directory containing the SKILL.md; **whole-segment exact comparison, case-insensitive** (`testing` ≠ `test`):
 
-Scan 汇总行的 breakdown check `skipped + updated + failed + gone + filtered == repos_total`（✓/⚠）用于校验仓库级过滤未漏计；本轮新去重的败者已先计入 `skipped`/`updated` 再被移出汇总，`repos_deduped` 是其事后细分；历史墓碑的跳过直接计入 `skipped`——均不参与该恒等式的额外项。
+- **Status words (any path segment, including the skill directory name)**: `deprecated` / `hidden` / `private` / `internal` / `obsolete` (`SKILL_EXCLUDE_ANY_DIRS`).
+- **Structural words (intermediate segments only, never the last segment)**: `test` / `tests` / `__tests__` / `spec` / `e2e` / `example` / `examples` / `sample` / `samples` / `demo` / `demos` / `fixture` / `fixtures` / `mock` / `mocks` / `stub` / `stubs` / `template` / `templates` / `scaffold` / `boilerplate` / `doc` / `docs` / `dist` / `build` / `out` / `node_modules` / `vendor` / `third_party` (`SKILL_EXCLUDE_DIRS`; the last segment is the skill directory name and is therefore exempt).
+- **Hidden directories (starting with `.`)**: excluded by default; standard public skill locations such as `.claude/skills/…`, `.agents/skills/…`, `.skills/…` are exempt; `.github` is never exempt.
+
+### S3 Non-public frontmatter (`github::is_nonpublic_frontmatter`)
+
+Parses the YAML frontmatter of SKILL.md; drops in the following cases:
+
+- `public: false`; or
+- any of these fields is truthy (`true` / `yes` / `1`, etc.): `deprecated` / `hidden` / `private` / `internal` / `obsolete` (`HIDDEN_FRONTMATTER_MARKERS`).
+
+Counter-examples (all kept): `hidden: false`, `public: true`, no related fields, missing frontmatter, or frontmatter that fails to parse.
+
+---
+
+## 3. Index-merge-level filters (`index::run_index`)
+
+The two upstream artifacts are joined on `(source, skillId)` (`skillId` is derived from the last path segment of `path`), anchored on the scan results.
+
+### I1 Orphan skills (in repo, not on the leaderboard) → kept
+
+`(source, directory name)` missing from the skills.sh leaderboard → still written to index.jsonl, but the `installs` / `weeklyInstalls` fields **do not appear**; appended at the end (entries with leaderboard data come first, in rank order). Counter: `scan_only`.
+
+### I2 Leaderboard mismatch (on the leaderboard, absent from the repo) → dropped
+
+Listed on the leaderboard but not found by the repo scan (deleted/renamed/moved) → dropped, guaranteeing every skill is backed by a real repository path. Counter: `not_in_repo`.
+
+### I3 Cross-repo skill dedup (`index::_dedup_skills`)
+
+Identical `skillId` and `description` (non-empty) → treated as mirrors/copies of the same skill; only the entry with the most `installs` survives within the group (ties keep the higher-ranked one). An empty `description` never participates in dedup. Counter: `deduped_skills`.
+
+---
+
+## 4. Configuration (`src/skills_index/config.py`)
+
+| Constant                       | Default              | Purpose                                                                     |
+| ------------------------------ | -------------------- | --------------------------------------------------------------------------- |
+| `MAX_SKILL_COUNT`              | `500`                | F4 cap; overridden by `--max-skill-count N`, `0` disables                    |
+| `SKILL_EXCLUDE_DIRS`           | structural-word set  | S2 excluded words for intermediate segments                                 |
+| `SKILL_EXCLUDE_ANY_DIRS`       | status-word set      | S2 excluded words for any segment (including the skill name)                 |
+| `HIDDEN_FRONTMATTER_MARKERS`   | status-word tuple    | S3 non-public frontmatter markers                                            |
+| `SCHEMA_VERSION`               | `5`                  | Bump when filter rules change → forces a one-time full rescan of existing caches |
+
+> Bump `SCHEMA_VERSION` after changing any filtering rule: in incremental mode, old caches were produced under the old rules, and only a version change forces a rebuild.
+
+## 5. Observability: run-summary counter mapping
+
+How the fields in `data/run-summary.md` after each `update` map to the rules:
+
+| run-summary field                              | Corresponding filter                                        |
+| ---------------------------------------------- | ----------------------------------------------------------- |
+| `dropped_non_github`                           | F2                                                          |
+| `repos_gone`                                   | F3                                                          |
+| `repos_filtered` / `repos_filtered_high_skill` | F4                                                          |
+| `repos_deduped`                                | F5 (shown only on hits)                                     |
+| `skills_filtered_nonpublic`                    | S2 + S3 (the volume actually parsed from tarballs this run) |
+| `scan_only`                                    | I1 (a retention count, not a filter count)                  |
+| `not_in_repo`                                  | I2                                                          |
+| `deduped_skills`                               | I3 (shown only on hits)                                     |
+
+The scan summary line's breakdown check `skipped + updated + failed + gone + filtered == repos_total` (✓/⚠) verifies that repo-level filtering is fully accounted for; losers newly deduped this round are counted into `skipped`/`updated` first and then removed from the summary, with `repos_deduped` as their post-hoc breakdown; skips of historical tombstones count directly into `skipped` — none of these add extra terms to that identity.
