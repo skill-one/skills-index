@@ -8,7 +8,7 @@ All filtering rules of the pipeline, in three layers: **repo-level** (drop the w
 
 ```
 skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ index.jsonl
-                   F1 F2      S1 S2 S3    I1 I2 I3
+                   F1 F2      S1 S2 S3 S4  I1 I2 I3
                              F3 F4 F5
 ```
 
@@ -19,14 +19,15 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
 | F3  | Repository gone                 | `scan::_scan_one_repo`                | GitHub 404 → drop all cached data for the repo                                                                |
 | F4  | High skill-count repos          | `scan::_scan_one_repo`                | skillCount > 500 (aggregator repos) → drop and tombstone the cache                                            |
 | F5  | Content-fingerprint mirror dedup | `scan::_dedup_repos`                 | Identical skill-tree blob shas → keep only the highest-starred one                                            |
-| S1  | Filename convention             | `github::_parse_tarball`              | Collect only `…/SKILL.md`; ignore every other file                                                            |
+| S1  | Filename convention             | `github::_parse_tarball`              | Collect only non-nested `…/SKILL.md` (a skill unit owns its subtree); ignore every other file                 |
 | S2  | Internal path filter            | `config::is_internal_skill_path`      | SKILL.md sits in an internal directory → drop                                                                 |
 | S3  | Non-public frontmatter          | `github::is_nonpublic_frontmatter`    | Author declares hidden/private/… → drop                                                                       |
+| S4  | Frontmatter validity            | `github::is_invalid_frontmatter`      | frontmatter lacks a non-empty `name` + `description` → drop                                                   |
 | I1  | Orphan skills                   | `index::run_index`                    | In repo, not on leaderboard → keep, metadata blanked (`installs: 0` / `weeklyInstalls: []`)                   |
 | I2  | Leaderboard mismatch            | `index::run_index`                    | On leaderboard, absent from repo scan → drop                                                                  |
 | I3  | Cross-repo skill dedup          | `index::_dedup_skills`                | skillId + description both match → keep the one with the most installs                                        |
 
-The final index is **anchored on the repo scan**: inclusion is decided by the scan results (which have already passed F1–F5 / S1–S3); the skills.sh leaderboard only attaches metadata such as `installs`; skills absent from the leaderboard enter the index with empty metadata (I1); leaderboard entries missing from the repo scan are removed by I2 — every skill in the index is backed by a repository path that currently exists.
+The final index is **anchored on the repo scan**: inclusion is decided by the scan results (which have already passed F1–F5 / S1–S4); the skills.sh leaderboard only attaches metadata such as `installs`; skills absent from the leaderboard enter the index with empty metadata (I1); leaderboard entries missing from the repo scan are removed by I2 — every skill in the index is backed by a repository path that currently exists.
 
 ---
 
@@ -65,11 +66,11 @@ The final index is **anchored on the repo scan**: inclusion is decided by the sc
 
 ## 2. In-repo skill-level filters
 
-These run in `github::_parse_tarball`; the order is the priority S1 → S2 → S3, and any hit drops the file (S2/S3 share the `skills_filtered_nonpublic` counter).
+These run in `github::_parse_tarball`; the order is the priority S1 → S2 → S3 → S4, and any hit drops the file (S2–S4 share the `skills_filtered` counter). S1's nested-payload skip happens before the filter chain and is not counted — nested files were never candidates.
 
-### S1 Filename convention
+### S1 Filename convention (and skill-unit nesting)
 
-Collect only files whose path ends with `/SKILL.md` (a skill must live inside its own directory, e.g. `skills/foo/SKILL.md`). A lone `SKILL.md` at the repository root is deliberately not collected.
+Collect only files whose path ends with `/SKILL.md` (a skill must live inside its own directory, e.g. `skills/foo/SKILL.md`) **and that are not nested inside another skill unit**: a directory containing SKILL.md is a self-contained unit and claims its whole subtree, so a SKILL.md below it is that unit's payload (a bundled template/example/asset), not an independent candidate — agents discover skills one level deep and could never trigger it separately. Claims are structural: the unit owns its subtree even when it is itself dropped by S2/S3/S4, so an invalid or hidden parent hides its nested files too. Directories without SKILL.md (category levels such as `skills/category/`) are traversed normally. A lone `SKILL.md` at the repository root is deliberately not collected (and claims nothing).
 
 ### S2 Internal path filter (`config::is_internal_skill_path`)
 
@@ -86,7 +87,14 @@ Parses the YAML frontmatter of SKILL.md; drops in the following cases:
 - `public: false`; or
 - any of these fields is truthy (`true` / `yes` / `1`, etc.): `deprecated` / `hidden` / `private` / `internal` / `obsolete` (`HIDDEN_FRONTMATTER_MARKERS`).
 
-Counter-examples (all kept): `hidden: false`, `public: true`, no related fields, missing frontmatter, or frontmatter that fails to parse.
+Counter-examples (all kept): `hidden: false`, `public: true`, and SKILL.md files with no related fields. (Missing or unparseable frontmatter is no longer kept either — S4 drops it.)
+
+### S4 Frontmatter validity (`github::is_invalid_frontmatter`)
+
+A SKILL.md counts as a skill only when its YAML frontmatter carries **both `name` and `description` as non-empty strings** — the two fields the agent-skills spec requires for a skill to be discoverable and triggerable by any agent (same judgment as the agents-skills installer). Dropped otherwise:
+
+- no frontmatter, or frontmatter that fails to parse;
+- `name` or `description` missing, not a string (e.g. a list/number), or blank after trimming.
 
 ---
 
@@ -116,7 +124,7 @@ Identical `skillId` and `description` (non-empty) → treated as mirrors/copies 
 | `SKILL_EXCLUDE_DIRS`           | structural-word set  | S2 excluded words for intermediate segments                                 |
 | `SKILL_EXCLUDE_ANY_DIRS`       | status-word set      | S2 excluded words for any segment (including the skill name)                 |
 | `HIDDEN_FRONTMATTER_MARKERS`   | status-word tuple    | S3 non-public frontmatter markers                                            |
-| `SCHEMA_VERSION`               | `5`                  | Bump when filter rules change → forces a one-time full rescan of existing caches |
+| `SCHEMA_VERSION`               | `6`                  | Bump when filter rules change → forces a one-time full rescan of existing caches |
 
 > Bump `SCHEMA_VERSION` after changing any filtering rule: in incremental mode, old caches were produced under the old rules, and only a version change forces a rebuild.
 
@@ -130,7 +138,7 @@ How the fields in `data/run-summary.md` after each `update` map to the rules:
 | `repos_gone`                                   | F3                                                          |
 | `repos_filtered` / `repos_filtered_high_skill` | F4                                                          |
 | `repos_deduped`                                | F5 (shown only on hits)                                     |
-| `skills_filtered_nonpublic`                    | S2 + S3 (the volume actually parsed from tarballs this run) |
+| `skills_filtered`                              | S2 + S3 + S4 (the volume actually parsed from tarballs this run) |
 | `scan_only`                                    | I1 (a retention count, not a filter count)                  |
 | `not_in_repo`                                  | I2                                                          |
 | `deduped_skills`                               | I3 (shown only on hits)                                     |

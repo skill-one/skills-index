@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import io
 import tarfile
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 
@@ -64,7 +65,7 @@ def _scan_repo(  # noqa: E501
 def get_skill_contents(  # noqa: E501
     source: str, branch: str = "HEAD", *, client: httpx.Client | None = None
 ) -> tuple[dict[str, tuple[str, str]], dict[str, str], int]:
-    """Return (blobs, contents, filtered_count) for every public SKILL.md.
+    """Return (blobs, contents, filtered_count) for every public, valid SKILL.md.
 
     - blobs:    {basename: (relative_path, blob_sha)}
     - contents: {relative_path: raw SKILL.md text}
@@ -73,8 +74,11 @@ def get_skill_contents(  # noqa: E501
     quota); the blob sha is computed locally with git's exact algorithm, so
     the repo-level fingerprints are comparable across runs and match the
     Trees API shas used by `get_tree_shas`. SKILL.md files on internal paths
-    (tests/examples/...) or marked non-public are filtered out and counted in
-    the third value.
+    (tests/examples/...), marked non-public, or lacking the required
+    frontmatter fields (`is_invalid_frontmatter`) are filtered out and
+    counted in the third value. Nested SKILL.md files — those inside another
+    skill's directory — are payload of that skill unit, not candidates, and
+    are skipped without entering the counter (see `_outermost_skill_dirs`).
     """
     client = client or new_github_client()
     return _scan_repo(source, branch, client=client)
@@ -92,10 +96,12 @@ def get_tree_shas(
     would show an unchanged set, and the tarball download can be skipped
     entirely). Internal paths (tests/examples/... — see
     `is_internal_skill_path`) are excluded so the comparison domain matches
-    the cached fingerprint, which only covers public skills; SKILL.md files
-    hidden via frontmatter markers cannot be recognized from the tree alone,
-    so repos carrying those simply never hit the pre-check (conservative:
-    they fall through to the tarball).
+    the cached fingerprint, which only covers public skills; nested SKILL.md
+    dirs (payload of an enclosing skill unit, see `_outermost_skill_dirs`)
+    are excluded for the same reason. SKILL.md files dropped by content-level
+    filters (frontmatter markers, missing required fields) cannot be
+    recognized from the tree alone, so repos carrying those simply never hit
+    the pre-check (conservative: they fall through to the tarball).
 
     Returns `None` when the tree is truncated (>100k entries / 7MB response)
     or the request fails: the caller should fall back to downloading the
@@ -107,13 +113,41 @@ def get_tree_shas(
     if data.get("truncated"):
         print(f"  [tree] {source}: tree truncated; falling back to tarball")
         return None
-    return {
+    shas = {
         e["path"][: -len("/SKILL.md")]: e["sha"]
         for e in data.get("tree", [])
         if e.get("type") == "blob"
         and e.get("path", "").endswith("/SKILL.md")
-        and not is_internal_skill_path(e["path"][: -len("/SKILL.md")])
     }
+    return {
+        d: shas[d]
+        for d in _outermost_skill_dirs(shas)
+        if not is_internal_skill_path(d)
+    }
+
+
+def _outermost_skill_dirs(dirs: Iterable[str]) -> list[str]:
+    """Return the dirs whose SKILL.md is not nested inside another skill unit.
+
+    A directory containing SKILL.md is a self-contained skill unit and claims
+    its whole subtree: a SKILL.md below it is that unit's payload (a bundled
+    template / example / asset), not an independent candidate — agents
+    discover skills one level deep, so a nested SKILL.md could never be
+    triggered as a skill of its own. Claims are structural and precede the
+    content filters: a unit owns its subtree even when it is itself dropped
+    by S2/S3/S4, so an invalid or hidden parent hides its nested files too.
+    Sorting makes parents precede children, so one pass suffices. A
+    repo-root SKILL.md never enters here (S1 does not collect it) and thus
+    never claims anything.
+    """
+    claimed: list[str] = []
+    out: list[str] = []
+    for d in sorted(dirs):
+        if any(d.startswith(c + "/") for c in claimed):
+            continue
+        claimed.append(d)
+        out.append(d)
+    return out
 
 
 def _parse_tarball(  # noqa: E501
@@ -123,16 +157,18 @@ def _parse_tarball(  # noqa: E501
 
     Non-public SKILL.md files are dropped before the basename-keyed dict is
     built, so a same-named test fixture can never shadow the real skill:
-    internal paths (tests/examples/templates/... -- see `is_internal_skill_path`)
-    and non-public frontmatter markers (`is_nonpublic_frontmatter`).
-    `filtered` counts how many were dropped.
+    internal paths (tests/examples/templates/... -- see `is_internal_skill_path`),
+    non-public frontmatter markers (`is_nonpublic_frontmatter`), and files
+    without the required `name` + `description` frontmatter
+    (`is_invalid_frontmatter`) all count toward `filtered`. Nested SKILL.md
+    files (inside another skill's directory) are payload of that skill unit:
+    they are skipped before the filter chain and do not count toward
+    `filtered` — they were never candidates (see `_outermost_skill_dirs`).
 
     The tarball has a top-level `<repo>-<sha>/` directory, which is stripped so
     `relative_path` is the path within the repo (as used elsewhere).
     """
-    blobs: dict[str, tuple[str, str]] = {}
-    contents: dict[str, str] = {}
-    filtered = 0
+    skill_members: dict[str, tarfile.TarInfo] = {}
     with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
         for member in tf.getmembers():
             if not member.isfile():
@@ -143,16 +179,21 @@ def _parse_tarball(  # noqa: E501
             rel = parts[1]
             if not rel.endswith("/SKILL.md"):
                 continue
-            skill_dir = rel[: -len("/SKILL.md")]
+            skill_members[rel[: -len("/SKILL.md")]] = member
+
+        blobs: dict[str, tuple[str, str]] = {}
+        contents: dict[str, str] = {}
+        filtered = 0
+        for skill_dir in _outermost_skill_dirs(skill_members):
             if is_internal_skill_path(skill_dir):
                 filtered += 1
                 continue
-            f = tf.extractfile(member)
+            f = tf.extractfile(skill_members[skill_dir])
             if f is None:
                 continue
             data = f.read()
             text = data.decode("utf-8", errors="replace")
-            if is_nonpublic_frontmatter(text):
+            if is_nonpublic_frontmatter(text) or is_invalid_frontmatter(text):
                 filtered += 1
                 continue
             blobs[skill_dir.rsplit("/", 1)[-1]] = (skill_dir, _git_blob_sha(data))
@@ -194,6 +235,25 @@ def is_nonpublic_frontmatter(markdown: str) -> bool:
     if data.get("public") is False:
         return True
     return any(data.get(marker) for marker in HIDDEN_FRONTMATTER_MARKERS)
+
+
+def is_invalid_frontmatter(markdown: str) -> bool:
+    """True if the SKILL.md lacks a usable `name` / `description` frontmatter.
+
+    name + description 是 agent skills 规范的必备字段：两者都必须是非空字符串，
+    技能才能被 agent 发现与触发。缺失任一字段、值为非字符串或纯空白、或没有
+    （可解析的）frontmatter 的 SKILL.md 无法作为技能工作，视为无效文件而非
+    公开技能（与 agents-skills 安装器的判定一致）。
+    """
+    data = parse_frontmatter(markdown)
+    name = data.get("name")
+    description = data.get("description")
+    return not (
+        isinstance(name, str)
+        and name.strip()
+        and isinstance(description, str)
+        and description.strip()
+    )
 
 
 def _is_missing_repo(exc: Exception) -> bool:

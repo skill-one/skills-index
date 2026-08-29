@@ -138,13 +138,20 @@ SCANNED_FILE = "scanned.jsonl"
 META_FILE = "meta.json"
 
 # Bump when the scan output format changes so stale caches are rebuilt once.
+# v6: 收录域收紧，需一次性重建：
+#   1) SKILL.md 有效性判定——frontmatter 必须含非空的 name + description
+#      （agent skills 规范必备字段，见 github.is_invalid_frontmatter），否则
+#      视为无效文件而非公开技能；
+#   2) 嵌套 payload——技能目录是自包含单元，其子树里的 SKILL.md 是该单元的
+#      payload 而非独立候选（见 github._outermost_skill_dirs），skillShas
+#      指纹域随之缩小。v5 缓存的 scanned.jsonl 可能收录了此类技能。
 # v5: cache split out of data/ (cache/by-source/), meta.json restructured as a
 #   tagged record (`status` = ok / filtered / tombstoned) with the fingerprint
 #   renamed to `skillShas` ({path: sha} of the repo's public SKILL.md files).
 #   Pre-v5 caches are rebuilt once on the next scan.
 # v4: skill 级过滤（内部路径 + 非公开 frontmatter 标记）——v3 缓存的
 # scanned.jsonl 可能含非公开技能，需要重建。
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Fields kept from the skills.sh payload. No URL is persisted: consumers
 # reconstruct the GitHub directory URL from `source` + `path` (see README).

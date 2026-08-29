@@ -171,15 +171,15 @@ def _scan_one_repo(
                     return cache.summarize()
 
     try:
-        blobs, contents, filtered_nonpublic = get_skill_contents(
+        blobs, contents, filtered_skills = get_skill_contents(
             source, branch, client=client
         )
     except Exception as exc:
         print(f"  [skip] {source}: scan failed - {exc}")
         bump("failed")
         return None
-    if filtered_nonpublic:
-        bump("skills_filtered_nonpublic", filtered_nonpublic)
+    if filtered_skills:
+        bump("skills_filtered", filtered_skills)
 
     skills = build_skill_records(blobs, contents)
 
@@ -205,7 +205,7 @@ def _scan_one_repo(
     bump("updated")
     bump("new_skills", len(skills))
     filtered_note = (
-        f", {filtered_nonpublic} non-public filtered" if filtered_nonpublic else ""
+        f", {filtered_skills} filtered (non-public/invalid)" if filtered_skills else ""
     )
     print(f"  [scan] {source}: {len(skills)} skills{filtered_note}")
     return cache.summarize()
@@ -256,7 +256,7 @@ def scan_repositories(
         "tree_skipped": 0,
         "new_skills": 0,
         "total_skills": 0,
-        "skills_filtered_nonpublic": 0,
+        "skills_filtered": 0,
     }
     counters_lock = threading.Lock()
     scanned: dict[str, JSON] = {}
@@ -342,7 +342,7 @@ def scan_repositories(
         "repos_tree_skipped": counters["tree_skipped"],
         "skills_scanned": counters["total_skills"],
         "skills_scanned_new": counters["new_skills"],
-        "skills_filtered_nonpublic": counters["skills_filtered_nonpublic"],
+        "skills_filtered": counters["skills_filtered"],
     }
     return summary
 

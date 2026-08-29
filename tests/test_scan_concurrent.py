@@ -62,7 +62,7 @@ def patched(monkeypatch, tmp_path):
     def fake_contents(source, branch, *, client=None):
         with lock:
             seen_threads.add(threading.get_ident())
-        # (blobs, contents, filtered_nonpublic): 每次重扫上报 1 个非公开技能被过滤。
+        # (blobs, contents, filtered): 每次重扫上报 1 个被过滤的技能。
         return (
             {"a": ("skills/a", f"sha-{source}")},
             {"skills/a": "---\ndescription: desc for a\n---\n"},
@@ -88,8 +88,8 @@ def test_scan_runs_concurrently_and_marks_threads(patched):
     # scan, including unchanged repos whose cached scanned.jsonl was reused.
     assert summary["skills_scanned"] == 6
     assert summary["skills_scanned_new"] == 3
-    # 只有重扫的仓库（4-6）上报非公开过滤计数；skipped 仓库不重新解析 tarball。
-    assert summary["skills_filtered_nonpublic"] == 3
+    # 只有重扫的仓库（4-6）上报过滤计数；skipped 仓库不重新解析 tarball。
+    assert summary["skills_filtered"] == 3
     assert scanned_repos.exists()
 
 

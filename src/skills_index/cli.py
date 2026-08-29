@@ -132,8 +132,8 @@ def _build_summary(
         f"- Breakdown check: `{bd_sum}` {bd_check}; updated share {share}",
         f"- Skills scanned (all valid repos): `{scan_sum.get('skills_scanned', 0)}`",
         f"- Skills scanned this run (incremental): `{scan_sum.get('skills_scanned_new', 0)}`",
-        f"- Skills filtered non-public (this run): "
-        f"`{scan_sum.get('skills_filtered_nonpublic', 0)}`",
+        f"- Skills filtered (non-public / invalid, this run): "
+        f"`{scan_sum.get('skills_filtered', 0)}`",
     ]
     # 去重行仅在命中时显示（去重仓库已计入 skipped/updated，属信息性细分）
     if scan_sum.get("repos_deduped"):

@@ -46,10 +46,10 @@ class _FakeClient:
 def test_get_skill_contents_downloads_tarball_once(monkeypatch) -> None:
     raw = _make_tarball(
         {
-            "skills/foo/SKILL.md": b"---\ndescription: Foo\n---\n",
+            "skills/foo/SKILL.md": b"---\nname: foo\ndescription: Foo\n---\n",
             # 同名测试夹具：过滤后不得覆盖真实技能
             "tests/foo/SKILL.md": b"---\ndescription: Fixture\n---\n",
-            "skills/bar/SKILL.md": b"---\ndescription: Bar\n---\n",
+            "skills/bar/SKILL.md": b"---\nname: bar\ndescription: Bar\n---\n",
         }
     )
     client = _FakeClient(raw)
@@ -58,8 +58,8 @@ def test_get_skill_contents_downloads_tarball_once(monkeypatch) -> None:
     assert client.requests == ["https://codeload.github.com/owner/repo/tar.gz/main"]
     assert set(blobs) == {"foo", "bar"}
     assert blobs["foo"][0] == "skills/foo"
-    assert contents["skills/foo"] == "---\ndescription: Foo\n---\n"
-    assert contents["skills/bar"] == "---\ndescription: Bar\n---\n"
+    assert contents["skills/foo"] == "---\nname: foo\ndescription: Foo\n---\n"
+    assert contents["skills/bar"] == "---\nname: bar\ndescription: Bar\n---\n"
     assert filtered == 1
 
 
@@ -114,6 +114,32 @@ def test_get_tree_shas_keeps_only_public_skill_dirs(monkeypatch) -> None:
         ".claude/skills/z": "sha-c",
     }
     assert client.requests == ["/repos/owner/repo/git/trees/main?recursive=1"]
+
+
+def test_get_tree_shas_excludes_nested_skill_dirs(monkeypatch) -> None:
+    """嵌套 SKILL.md 是父技能单元的 payload，不进入预检比对域；
+    分类目录（非技能单元）下的技能正常保留，与 tarball 扫描域一致。"""
+    payload = {
+        "truncated": False,
+        "tree": [
+            {"type": "blob", "path": "skills/a/SKILL.md", "sha": "sha-a"},
+            {"type": "blob", "path": "skills/a/nested/SKILL.md", "sha": "sha-n"},
+            {"type": "blob", "path": "skills/a/nested/deep/SKILL.md", "sha": "sha-d"},
+            {"type": "blob", "path": "skills/cat/b/SKILL.md", "sha": "sha-b"},
+            {"type": "blob", "path": "tests/x/SKILL.md", "sha": "sha-t"},
+            {"type": "blob", "path": "tests/x/y/SKILL.md", "sha": "sha-ty"},
+            {"type": "blob", "path": ".claude/skills/z/SKILL.md", "sha": "sha-c"},
+        ],
+    }
+    client = _FakeJsonClient(payload)
+
+    shas = get_tree_shas("owner/repo", "main", client=client)  # type: ignore[arg-type]
+
+    assert shas == {
+        "skills/a": "sha-a",
+        "skills/cat/b": "sha-b",
+        ".claude/skills/z": "sha-c",
+    }
 
 
 def test_get_tree_shas_truncated_returns_none(monkeypatch) -> None:

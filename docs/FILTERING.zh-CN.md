@@ -8,7 +8,7 @@
 
 ```
 skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ index.jsonl
-                   F1 F2      S1 S2 S3    I1 I2 I3
+                   F1 F2      S1 S2 S3 S4  I1 I2 I3
                              F3 F4 F5
 ```
 
@@ -19,14 +19,15 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
 | F3 | 仓库已不存在 | `scan::_scan_one_repo` | GitHub 404 → 删除该仓库全部缓存数据 |
 | F4 | 高技能数仓库 | `scan::_scan_one_repo` | skillCount > 500（聚合型仓库）→ 丢弃并墓碑化缓存 |
 | F5 | 内容指纹镜像去重 | `scan::_dedup_repos` | 整棵技能树 blob sha 全等 → 只留星数最高者 |
-| S1 | 文件名约定 | `github::_parse_tarball` | 只收集 `…/SKILL.md`，其余文件一律忽略 |
+| S1 | 文件名约定 | `github::_parse_tarball` | 只收集非嵌套的 `…/SKILL.md`（技能单元拥有其子树），其余文件一律忽略 |
 | S2 | 内部路径过滤 | `config::is_internal_skill_path` | SKILL.md 位于仓库内部目录 → 丢弃 |
 | S3 | 非公开 frontmatter | `github::is_nonpublic_frontmatter` | 作者声明 hidden/private/… → 丢弃 |
+| S4 | frontmatter 有效性 | `github::is_invalid_frontmatter` | frontmatter 缺非空的 `name` + `description` → 丢弃 |
 | I1 | 孤儿技能 | `index::run_index` | 仓库有、榜单无 → 保留，元数据置空（`installs: 0` / `weeklyInstalls: []`） |
 | I2 | 榜单失配 | `index::run_index` | 榜单有、仓库扫描没有 → 剔除 |
 | I3 | 跨仓库技能去重 | `index::_dedup_skills` | skillId + description 双匹配 → 保留 installs 最高者 |
 
-最终索引以**仓库扫描为基准**：收录范围由扫描结果决定（扫描已过 F1–F5 / S1–S3），skills.sh 榜单只挂载 `installs` 等元数据，未收录技能以空元数据入索引（I1）；榜单有、仓库无的技能被 I2 剔除——索引中的每个技能都有当前真实存在的仓库路径背书。
+最终索引以**仓库扫描为基准**：收录范围由扫描结果决定（扫描已过 F1–F5 / S1–S4），skills.sh 榜单只挂载 `installs` 等元数据，未收录技能以空元数据入索引（I1）；榜单有、仓库无的技能被 I2 剔除——索引中的每个技能都有当前真实存在的仓库路径背书。
 
 ---
 
@@ -65,11 +66,11 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
 
 ## 二、仓库内 skill 级过滤
 
-发生在 `github::_parse_tarball`，顺序即优先级 S1 → S2 → S3，任一命中即丢弃（S2/S3 共用计数 `skills_filtered_nonpublic`）。
+发生在 `github::_parse_tarball`，顺序即优先级 S1 → S2 → S3 → S4，任一命中即丢弃（S2–S4 共用计数 `skills_filtered`）。S1 的嵌套 payload 跳过发生在过滤链之前且不计数——嵌套文件从来不是候选。
 
-### S1 文件名约定
+### S1 文件名约定（含技能单元嵌套）
 
-只收集路径以 `/SKILL.md` 结尾的文件（技能必须位于自己的目录内，如 `skills/foo/SKILL.md`）。仓库根级单独的 `SKILL.md` 有意不收集。
+只收集路径以 `/SKILL.md` 结尾的文件（技能必须位于自己的目录内，如 `skills/foo/SKILL.md`），且**不得嵌套在另一个技能单元内**：含 SKILL.md 的目录是一个自包含单元并认领其整棵子树，其下的 SKILL.md 是该单元的 payload（内置模板/示例/资源），不是独立候选——agent 一层发现技能，嵌套的 SKILL.md 无法被独立触发。认领是结构性的：单元即使自身被 S2/S3/S4 丢弃也拥有子树，无效或隐藏的父单元同样隐藏其嵌套文件。无 SKILL.md 的目录（如 `skills/category/` 分类层）正常下探。仓库根级单独的 `SKILL.md` 有意不收集（也不认领任何子树）。
 
 ### S2 内部路径过滤（`config::is_internal_skill_path`）
 
@@ -86,7 +87,14 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
 - `public: false`；
 - 以下字段为真值（`true` / `yes` / `1` 等）：`deprecated` / `hidden` / `private` / `internal` / `obsolete`（`HIDDEN_FRONTMATTER_MARKERS`）。
 
-反例（均保留）：`hidden: false`、`public: true`、无相关字段、frontmatter 缺失或解析失败。
+反例（均保留）：`hidden: false`、`public: true`、无相关字段。（frontmatter 缺失或解析失败也不再保留——由 S4 丢弃。）
+
+### S4 frontmatter 有效性（`github::is_invalid_frontmatter`）
+
+SKILL.md 的 YAML frontmatter 必须同时含**非空字符串的 `name` 和 `description`** 才算技能——这是 agent skills 规范要求技能可被发现、可被触发的两个必备字段（与 agents-skills 安装器的判定一致）。以下情况丢弃：
+
+- 无 frontmatter，或 frontmatter 解析失败；
+- `name` 或 `description` 缺失、不是字符串（如列表/数字）、或去除空白后为空。
 
 ---
 
@@ -116,7 +124,7 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
 | `SKILL_EXCLUDE_DIRS` | 结构词集合 | S2 中间目录段排除词 |
 | `SKILL_EXCLUDE_ANY_DIRS` | 状态词集合 | S2 任意段排除词（含技能名） |
 | `HIDDEN_FRONTMATTER_MARKERS` | 状态词元组 | S3 frontmatter 非公开标记 |
-| `SCHEMA_VERSION` | `5` | 过滤规则变更时递增 → 触发存量缓存一次性全量重扫 |
+| `SCHEMA_VERSION` | `6` | 过滤规则变更时递增 → 触发存量缓存一次性全量重扫 |
 
 > 修改任何过滤规则后应递增 `SCHEMA_VERSION`：增量模式下旧缓存按旧规则生成，只有版本号变化才会强制重建。
 
@@ -130,7 +138,7 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
 | `repos_gone` | F3 |
 | `repos_filtered` / `repos_filtered_high_skill` | F4 |
 | `repos_deduped` | F5（命中时才显示） |
-| `skills_filtered_nonpublic` | S2 + S3（本次实际解析 tarball 的量） |
+| `skills_filtered` | S2 + S3 + S4（本次实际解析 tarball 的量） |
 | `scan_only` | I1（保留计数，非过滤量） |
 | `not_in_repo` | I2 |
 | `deduped_skills` | I3（命中时才显示） |

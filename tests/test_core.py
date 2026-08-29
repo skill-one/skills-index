@@ -12,6 +12,7 @@ from skills_index.github import (
     _git_blob_sha,
     _parse_tarball,
     extract_description,
+    is_invalid_frontmatter,
     is_nonpublic_frontmatter,
 )
 from skills_index.io_utils import read_jsonl, write_jsonl
@@ -76,17 +77,17 @@ def test_read_jsonl_missing_file(tmp_path: Path) -> None:
 def test_parse_tarball_finds_skill_blobs() -> None:
     raw = _make_tarball(
         {
-            "skills/foo/SKILL.md": b"---\ndescription: Foo\n---\n",
+            "skills/foo/SKILL.md": b"---\nname: foo\ndescription: Foo\n---\n",
             "skills/foo/README.md": b"ignored",
-            "skills/bar/baz/SKILL.md": b"---\ndescription: Baz\n---\n",
+            "skills/bar/baz/SKILL.md": b"---\nname: baz\ndescription: Baz\n---\n",
         }
     )
     blobs, contents, filtered = _parse_tarball(raw)
     assert blobs == {
-        "foo": ("skills/foo", _git_blob_sha(b"---\ndescription: Foo\n---\n")),
-        "baz": ("skills/bar/baz", _git_blob_sha(b"---\ndescription: Baz\n---\n")),
+        "foo": ("skills/foo", _git_blob_sha(b"---\nname: foo\ndescription: Foo\n---\n")),
+        "baz": ("skills/bar/baz", _git_blob_sha(b"---\nname: baz\ndescription: Baz\n---\n")),
     }
-    assert contents["skills/foo"] == "---\ndescription: Foo\n---\n"
+    assert contents["skills/foo"] == "---\nname: foo\ndescription: Foo\n---\n"
     assert filtered == 0
 
 
@@ -106,14 +107,14 @@ def test_parse_tarball_skips_non_skill_files() -> None:
 def test_parse_tarball_filters_internal_paths() -> None:
     raw = _make_tarball(
         {
-            "skills/foo/SKILL.md": b"---\ndescription: Real foo\n---\n",
+            "skills/foo/SKILL.md": b"---\nname: foo\ndescription: Real foo\n---\n",
             # 同名测试夹具：必须被过滤，不得按 tar 顺序覆盖真实技能。
             "tests/foo/SKILL.md": b"---\ndescription: Fixture foo\n---\n",
             "examples/demo/SKILL.md": b"---\ndescription: Demo\n---\n",
             ".github/skill/SKILL.md": b"---\ndescription: Config\n---\n",
             # 歧义词：作为中间目录段过滤，作为技能名保留。
             "e2e/helper/SKILL.md": b"---\ndescription: E2E helper\n---\n",
-            "skills/e2e/SKILL.md": b"---\ndescription: E2E skill\n---\n",
+            "skills/e2e/SKILL.md": b"---\nname: e2e\ndescription: E2E skill\n---\n",
             # 状态词目录：任意段命中即过滤。
             "skills/deprecated/old/SKILL.md": b"---\ndescription: Old\n---\n",
         }
@@ -123,10 +124,10 @@ def test_parse_tarball_filters_internal_paths() -> None:
     assert set(blobs) == {"foo", "e2e"}
     assert blobs["foo"] == (
         "skills/foo",
-        _git_blob_sha(b"---\ndescription: Real foo\n---\n"),
+        _git_blob_sha(b"---\nname: foo\ndescription: Real foo\n---\n"),
     )
     assert "tests/foo" not in contents
-    assert contents["skills/e2e"] == "---\ndescription: E2E skill\n---\n"
+    assert contents["skills/e2e"] == "---\nname: e2e\ndescription: E2E skill\n---\n"
 
 
 def test_parse_tarball_filters_nonpublic_frontmatter() -> None:
@@ -136,13 +137,86 @@ def test_parse_tarball_filters_nonpublic_frontmatter() -> None:
             "skills/deprecated/SKILL.md": b"---\nname: d\ndeprecated: yes\n---\n",
             "skills/unlisted/SKILL.md": b"---\nname: u\npublic: false\n---\n",
             "skills/ok/SKILL.md": b"---\nname: ok\ndescription: public\n---\n",
-            "skills/no-fm/SKILL.md": b"# no frontmatter\n",
         }
     )
     blobs, contents, filtered = _parse_tarball(raw)
     assert filtered == 3
-    assert set(blobs) == {"ok", "no-fm"}
+    assert set(blobs) == {"ok"}
     assert contents["skills/ok"] == "---\nname: ok\ndescription: public\n---\n"
+
+
+def test_parse_tarball_filters_invalid_frontmatter() -> None:
+    """frontmatter 缺必备字段（非空 name + description）的 SKILL.md 视为无效
+    文件：无法被 agent 发现/触发，不进入索引（对齐 agents-skills 判定）。"""
+    raw = _make_tarball(
+        {
+            "skills/no-fm/SKILL.md": b"# no frontmatter\n",
+            "skills/broken-fm/SKILL.md": b"---\ninvalid: [unclosed\n---\n",
+            "skills/no-name/SKILL.md": b"---\ndescription: d\n---\n",
+            "skills/no-desc/SKILL.md": b"---\nname: n\n---\n",
+            "skills/empty-name/SKILL.md": b'---\nname: ""\ndescription: d\n---\n',
+            "skills/blank-desc/SKILL.md": b'---\nname: n\ndescription: "  "\n---\n',
+            "skills/list-name/SKILL.md": b"---\nname: [a, b]\ndescription: d\n---\n",
+            "skills/ok/SKILL.md": b"---\nname: ok\ndescription: fine\n---\n",
+        }
+    )
+    blobs, _contents, filtered = _parse_tarball(raw)
+    assert filtered == 7
+    assert set(blobs) == {"ok"}
+
+
+def test_parse_tarball_nested_skill_md_is_payload() -> None:
+    """技能目录是自包含单元：其子树里的 SKILL.md 是该单元的 payload，
+    不是独立候选（agent 一层发现，嵌套技能无法被独立触发），静默跳过、
+    不计入过滤计数。认领是结构性的：父单元即使被内容过滤丢弃也拥有子树。"""
+    ok = b"---\nname: n\ndescription: d\n---\n"
+    raw = _make_tarball(
+        {
+            "skills/foo/SKILL.md": ok,
+            "skills/foo/nested/SKILL.md": ok,  # foo 的 payload
+            "skills/foo/nested/deep/SKILL.md": ok,  # 同上（foo 的认领覆盖整棵子树）
+            "skills/category/bar/SKILL.md": ok,  # category 非技能单元，正常收录
+            "skills/bad/SKILL.md": b"---\ndescription: no name\n---\n",  # S4 丢弃但认领
+            "skills/bad/child/SKILL.md": ok,  # payload → 不单独收录
+            "skills/hidden/SKILL.md": b"---\nname: h\ndescription: x\nhidden: true\n---\n",
+            "skills/hidden/child/SKILL.md": ok,  # payload → 不单独收录
+            "tests/x/SKILL.md": ok,  # S2 丢弃但认领
+            "tests/x/y/SKILL.md": ok,  # payload → 不重复计数
+        }
+    )
+    blobs, contents, filtered = _parse_tarball(raw)
+    assert set(blobs) == {"foo", "bar"}
+    assert "skills/foo/nested" not in contents
+    assert filtered == 3  # bad(S4) + hidden(S3) + tests/x(S2)；嵌套 payload 不计
+
+
+def test_parse_tarball_siblings_under_category_dirs_are_kept() -> None:
+    """下探只在技能单元边界停止：无 SKILL.md 的分类目录继续下探。"""
+    ok = b"---\nname: n\ndescription: d\n---\n"
+    raw = _make_tarball(
+        {
+            "skills/a/b/c/SKILL.md": ok,
+            "skills/a/b/d/SKILL.md": ok,
+            "other/e/SKILL.md": ok,
+        }
+    )
+    blobs, _contents, filtered = _parse_tarball(raw)
+    assert set(blobs) == {"c", "d", "e"}
+    assert filtered == 0
+
+
+def test_is_invalid_frontmatter_requires_name_and_description() -> None:
+    # 无 frontmatter / YAML 解析失败：无效。
+    assert is_invalid_frontmatter("# no frontmatter\n")
+    assert is_invalid_frontmatter("---\ninvalid: [unclosed\n---\n")
+    # 缺任一必备字段 / 空白值 / 非字符串值：无效。
+    assert is_invalid_frontmatter("---\ndescription: d\n---\n")
+    assert is_invalid_frontmatter("---\nname: n\n---\n")
+    assert is_invalid_frontmatter('---\nname: ""\ndescription: d\n---\n')
+    assert is_invalid_frontmatter('---\nname: n\ndescription: "  "\n---\n')
+    assert is_invalid_frontmatter("---\nname: [a]\ndescription: d\n---\n")
+    # name + description 均为非空字符串：有效。
+    assert not is_invalid_frontmatter("---\nname: n\ndescription: d\n---\n")
 
 
 def test_is_nonpublic_frontmatter_markers() -> None:
