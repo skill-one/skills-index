@@ -19,7 +19,7 @@ import httpx
 import yaml
 
 from .config import HIDDEN_FRONTMATTER_MARKERS, JSON, is_internal_skill_path
-from .http import get_json, new_github_client
+from .http import HttpError, get_json, new_github_client
 
 # codeload serves archive downloads and is not part of the REST API rate limit.
 CODELOAD = "https://codeload.github.com"
@@ -51,11 +51,6 @@ def _split(source: str) -> tuple[str, str]:
     return owner, repo
 
 
-def get_default_branch(source: str, *, client: httpx.Client | None = None) -> str:
-    """Return the repository default branch (cached)."""
-    return _repo_info(source, client=client)[1]
-
-
 def _git_blob_sha(content: bytes) -> str:
     """Return the git blob sha1 (`sha1("blob <len>\\0" + content)`).
 
@@ -66,8 +61,7 @@ def _git_blob_sha(content: bytes) -> str:
 
 
 # Per-run cache: source -> (blobs, contents, filtered_count). Populated once
-# per repo by the first tarball download; `get_skill_descriptions` reuses the
-# cached contents so no additional API calls are made.
+# per repo by the first tarball download.
 #   blobs:    {basename: (relative_path, blob_sha)}
 #   contents: {relative_path: raw SKILL.md text}
 _tarball_scan: dict[str, tuple[dict[str, tuple[str, str]], dict[str, str], int]] = {}
@@ -161,28 +155,24 @@ def _scan_repo(  # noqa: E501
     return result
 
 
-def get_skill_blobs(  # noqa: E501
+def get_skill_contents(  # noqa: E501
     source: str, branch: str = "HEAD", *, client: httpx.Client | None = None
-) -> tuple[dict[str, tuple[str, str]], int]:
-    """Return ({basename: (relative_path, blob_sha)}, internal_filtered_count).
+) -> tuple[dict[str, tuple[str, str]], dict[str, str], int]:
+    """Return (blobs, contents, filtered_count) for every public SKILL.md.
 
-    Backed by a single codeload tarball download (not billed to the REST quota);
-    the blob sha is computed locally with git's exact algorithm, keeping the
-    file-level incremental fingerprints identical to the previous tree-based
-    approach. SKILL.md files on internal paths (tests/examples/...) are
-    filtered out and counted in the second return value.
+    - blobs:    {basename: (relative_path, blob_sha)}
+    - contents: {relative_path: raw SKILL.md text}
+
+    Backed by a single codeload tarball download (not billed to the REST
+    quota); the blob sha is computed locally with git's exact algorithm, so
+    the repo-level fingerprints are comparable across runs and match the
+    Trees API shas used by `get_tree_shas`. SKILL.md files on internal paths
+    (tests/examples/...) or marked non-public are filtered out and counted in
+    the third value. The tarball is cached per run, so later calls for the
+    same source perform no network I/O.
     """
     client = client or new_github_client()
-    blobs, _contents, filtered = _scan_repo(source, branch, client=client)
-    return blobs, filtered
-
-
-def get_skill_dirs(  # noqa: E501
-    source: str, branch: str = "HEAD", *, client: httpx.Client | None = None
-) -> dict[str, str]:
-    """Return {basename: relative_path} of every dir containing SKILL.md."""
-    blobs, _filtered = get_skill_blobs(source, branch, client=client)
-    return {name: path for name, (path, _sha) in blobs.items()}
+    return _scan_repo(source, branch, client=client)
 
 
 def parse_frontmatter(markdown: str) -> dict[str, JSON]:
@@ -221,48 +211,14 @@ def is_nonpublic_frontmatter(markdown: str) -> bool:
     return any(data.get(marker) for marker in HIDDEN_FRONTMATTER_MARKERS)
 
 
-def get_skill_descriptions(  # noqa: E501
-    source: str,
-    blobs: dict[str, tuple[str, str]],
-    *,
-    client: httpx.Client | None = None,
-) -> dict[str, str]:
-    """Return {basename: description} from the already-downloaded tarball.
-
-    `blobs` is a {basename: (relative_path, blob_sha)} subset -- typically just
-    the blobs whose sha changed since the last scan. The tarball was already
-    fetched by `get_skill_blobs` (cached in `_tarball_scan`), so this performs
-    no network I/O; unchanged skills keep their old records via `scan`.
-    """
-    if not blobs:
-        return {}
-    client = client or new_github_client()
-    _full_blobs, contents, _filtered = _scan_repo(source, "HEAD", client=client)
-    out: dict[str, str] = {}
-    for name, (path, _sha) in blobs.items():
-        out[name] = extract_description(contents.get(path, ""))
-    return out
-
-
-def get_repo_meta(source: str, *, client: httpx.Client | None = None) -> tuple[str, str, int]:
-    """Return (pushed_at, default_branch, stars)."""
-    return _repo_info(source, client=client)
-
-
 def _is_missing_repo(exc: Exception) -> bool:
-    """True if the failure chain contains a definitive 404 (repo not found).
+    """True if the failure is a definitive 404 (repo deleted / renamed / private).
 
-    `get_json` wraps a 404 as ``HttpError from HTTPStatusError(404)``, so we
-    walk the cause chain looking for that HTTP status.
+    `get_json` wraps such responses as ``HttpError`` with ``status=404``;
+    other failures (network errors, 5xx, rate limits) are not definitive and
+    must not drop a repo's cached data.
     """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        if isinstance(cur, httpx.HTTPStatusError) and cur.response.status_code == 404:
-            return True
-        cur = cur.__cause__
-    return False
+    return isinstance(exc, HttpError) and exc.status == 404
 
 
 def get_repo_metas(

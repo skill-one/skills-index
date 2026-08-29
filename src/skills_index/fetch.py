@@ -9,7 +9,6 @@ from pathlib import Path
 from .config import (
     BY_SOURCE_DIR,
     DIR_SEP,
-    FETCHED_FILE,
     FETCHED_SKILLS,
     JSON,
     KEEP_FIELDS,
@@ -85,7 +84,12 @@ def filter_github(skills: list[Record]) -> tuple[list[Record], int]:
 
 
 def distribute_by_source(skills: list[Record], base_dir: Path = BY_SOURCE_DIR) -> tuple[int, int]:
-    """Group skills by source into `base_dir/<owner>__<repo>/fetched.jsonl`."""
+    """Group skills by source into `base_dir/<owner>__<repo>/` directories.
+
+    Only the directories are created here: `scan` keys off their existence,
+    while the actual fetched records live in the root `fetched-skills.jsonl`
+    (a per-dir copy would just duplicate it inside the published snapshot).
+    """
     groups: dict[str, list[Record]] = {}
     for s in skills:
         src = str(s.get("source", "")).strip()
@@ -93,26 +97,25 @@ def distribute_by_source(skills: list[Record], base_dir: Path = BY_SOURCE_DIR) -
             groups.setdefault(src, []).append(s)
 
     total = 0
-    for src, items in groups.items():
-        dir_path = base_dir / source_to_dir(src)
-        write_jsonl(dir_path / FETCHED_FILE, items)
-        total += len(items)
-        print(f"  wrote {dir_path / FETCHED_FILE}: {len(items)}")
+    for src in groups:
+        (base_dir / source_to_dir(src)).mkdir(parents=True, exist_ok=True)
+        total += len(groups[src])
+    print(f"  prepared {len(groups)} source dirs, {total} records")
     return len(groups), total
 
 
 def prune_stale_repos(sources: set[str], base_dir: Path = BY_SOURCE_DIR) -> int:
     """Remove by-source dirs whose source is not in `sources` (incremental mode).
 
-    Called after a full fetch in incremental mode: repos that vanished from the
-    skills.sh ranking keep a stale `scanned.jsonl` that would otherwise leak
-    into `index.jsonl`. Only dirs matching the `owner__repo` layout (exactly one
-    `DIR_SEP`) are considered, so unrelated files stay intact. Returns the
-    number of removed dirs.
+    Called after a complete fetch in incremental mode: repos that vanished
+    from the skills.sh ranking keep a stale `scanned.jsonl` that would
+    otherwise leak into `index.jsonl`. Only dirs matching the `owner__repo`
+    layout (containing `DIR_SEP`) are considered, so unrelated files stay
+    intact. Returns the number of removed dirs.
     """
     removed = 0
     for d in sorted(base_dir.iterdir(), key=lambda p: p.name):
-        if not (d.is_dir() and d.name.count(DIR_SEP) == 1):
+        if not (d.is_dir() and DIR_SEP in d.name):
             continue
         if dir_to_source(d.name) not in sources:
             shutil.rmtree(d)

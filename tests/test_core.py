@@ -12,11 +12,10 @@ from skills_index.github import (
     _git_blob_sha,
     _parse_tarball,
     extract_description,
-    get_skill_descriptions,
     is_nonpublic_frontmatter,
 )
 from skills_index.io_utils import read_jsonl, write_jsonl
-from skills_index.scan import merge_skill_records, plan_blob_fetches
+from skills_index.scan import build_skill_records
 
 
 def _make_tarball(files: dict[str, bytes]) -> bytes:
@@ -36,10 +35,13 @@ def test_source_dir_roundtrip() -> None:
 
 
 def test_source_dir_only_first_sep_split() -> None:
-    # source is always `owner/repo`; deeper slashes are NOT supported and
-    # the mapping is only guaranteed lossless for a single separator.
+    # dir_to_source splits on the FIRST separator, so repo names containing
+    # `__` round-trip losslessly (owner names cannot contain underscores at
+    # all, so the first separator is always the real one).
     assert config.source_to_dir("a/b/c") == "a__b__c"
     assert config.dir_to_source("a__b__c") == "a/b__c"
+    assert config.source_to_dir("owner/my__repo") == "owner__my__repo"
+    assert config.dir_to_source("owner__my__repo") == "owner/my__repo"
 
 
 def test_is_github_source() -> None:
@@ -252,56 +254,35 @@ def test_extract_description_missing_returns_empty() -> None:
     assert extract_description("---\ninvalid: [unclosed\n---") == ""
 
 
-def test_plan_blob_fetches_incremental() -> None:
+def test_build_skill_records_sorts_by_path_and_parses_locally() -> None:
     blobs = {
-        "a": ("skills/a", "sha1"),
-        "b": ("skills/b", "sha2"),
-        "c": ("skills/c", "sha3"),
+        "b": ("skills/b", "sha-b"),
+        "a": ("skills/a", "sha-a"),
     }
-    prev = {"skills/a": "sha1", "skills/b": "old-sha"}
-    # Only changed or new blobs are refetched; unchanged `a` is skipped.
-    assert plan_blob_fetches(blobs, prev, force=False, schema_upgrade=False) == {
-        "b": ("skills/b", "sha2"),
-        "c": ("skills/c", "sha3"),
+    contents = {
+        "skills/a": "---\ndescription: A\n---\n",
+        "skills/b": "---\ndescription: B\n---\n",
     }
-    # force / schema upgrade refetch everything.
-    assert plan_blob_fetches(blobs, prev, force=True, schema_upgrade=False) == blobs
-    assert plan_blob_fetches(blobs, prev, force=False, schema_upgrade=True) == blobs
-
-
-def test_merge_skill_records_incremental() -> None:
-    blobs = {"a": ("skills/a", "sha1"), "b": ("skills/b", "sha2-new")}
-    old = [
-        {"path": "skills/a", "description": "old-a"},
-        {"path": "skills/b", "description": "old-b"},
-        {"path": "skills/removed", "description": "gone"},
-    ]
-    prev = {"skills/a": "sha1", "skills/b": "sha2-old", "skills/removed": "x"}
-    merged = merge_skill_records(
-        blobs, {"b": "new-b"}, old, prev, force=False, schema_upgrade=False
-    )
-    assert merged == [
-        {"path": "skills/a", "description": "old-a"},
-        {"path": "skills/b", "description": "new-b"},
+    assert build_skill_records(blobs, contents) == [
+        {"path": "skills/a", "description": "A"},
+        {"path": "skills/b", "description": "B"},
     ]
 
 
-def test_merge_skill_records_force_rebuilds_all() -> None:
-    blobs = {"a": ("skills/a", "sha1")}
-    old = [{"path": "skills/a", "description": "old-a"}]
-    prev = {"skills/a": "sha1"}
-    force_merged = merge_skill_records(
-        blobs, {"a": "new-a"}, old, prev, force=True, schema_upgrade=False
-    )
-    assert force_merged == [{"path": "skills/a", "description": "new-a"}]
-    upgraded = merge_skill_records(
-        blobs, {"a": "new-a"}, old, prev, force=False, schema_upgrade=True
-    )
-    assert upgraded == [{"path": "skills/a", "description": "new-a"}]
+def test_build_skill_records_missing_content_yields_empty_description() -> None:
+    assert build_skill_records({"a": ("skills/a", "sha-a")}, {}) == [
+        {"path": "skills/a", "description": ""}
+    ]
 
 
-def test_get_skill_descriptions_empty_subset_skips_network() -> None:
-    assert get_skill_descriptions("owner/repo", {}) == {}
+def test_iter_repo_dirs_accepts_underscores_in_repo_names(tmp_path: Path) -> None:
+    # repo 名可含连续下划线（owner 名不可能）：映射按第一个分隔符分割，
+    # 往返无损，这样的目录不得被静默排除。
+    (tmp_path / "owner__my__repo").mkdir()
+    (tmp_path / "owner__repo").mkdir()
+    (tmp_path / "unrelated").mkdir()
+    (tmp_path / "loose-file").write_text("x")
+    assert config.iter_repo_dirs(tmp_path) == ["owner__my__repo", "owner__repo"]
 
 
 def test_load_github_token_prefers_gh_pat(monkeypatch) -> None:

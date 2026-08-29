@@ -1,7 +1,7 @@
 """End-to-end tests for the codeload tarball scan path (no real network).
 
-Verifies that `get_skill_blobs` downloads a repo tarball exactly once and that
-`get_skill_descriptions` reuses the cached contents without further requests.
+Verifies that `get_skill_contents` downloads a repo tarball exactly once and
+caches the parsed result for the rest of the run.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import io
 import tarfile
 
 from skills_index import github
-from skills_index.github import get_skill_blobs, get_skill_descriptions
+from skills_index.github import get_skill_contents
 
 
 def _make_tarball(files: dict[str, bytes]) -> bytes:
@@ -47,7 +47,7 @@ def _reset_cache(monkeypatch) -> None:
     monkeypatch.setattr(github, "_tarball_scan", {})
 
 
-def test_get_skill_blobs_downloads_tarball_once(monkeypatch) -> None:
+def test_get_skill_contents_downloads_tarball_once(monkeypatch) -> None:
     _reset_cache(monkeypatch)
     raw = _make_tarball(
         {
@@ -58,15 +58,17 @@ def test_get_skill_blobs_downloads_tarball_once(monkeypatch) -> None:
         }
     )
     client = _FakeClient(raw)
-    blobs, filtered = get_skill_blobs("owner/repo", "main", client=client)  # type: ignore[arg-type]
+    blobs, contents, filtered = get_skill_contents("owner/repo", "main", client=client)  # type: ignore[arg-type]
 
     assert client.requests == ["https://codeload.github.com/owner/repo/tar.gz/main"]
     assert set(blobs) == {"foo", "bar"}
     assert blobs["foo"][0] == "skills/foo"
+    assert contents["skills/foo"] == "---\ndescription: Foo\n---\n"
+    assert contents["skills/bar"] == "---\ndescription: Bar\n---\n"
     assert filtered == 1
 
 
-def test_get_skill_descriptions_reuses_cached_tarball(monkeypatch) -> None:
+def test_get_skill_contents_caches_per_run(monkeypatch) -> None:
     _reset_cache(monkeypatch)
     raw = _make_tarball(
         {
@@ -76,9 +78,9 @@ def test_get_skill_descriptions_reuses_cached_tarball(monkeypatch) -> None:
     )
     client = _FakeClient(raw)
 
-    blobs, _filtered = get_skill_blobs("owner/repo", "main", client=client)  # type: ignore[arg-type]
-    # Fetching descriptions must not issue a second tarball request.
-    descs = get_skill_descriptions("owner/repo", blobs, client=client)  # type: ignore[arg-type]
+    # A second call for the same source must reuse the cached tarball.
+    first = get_skill_contents("owner/repo", "main", client=client)  # type: ignore[arg-type]
+    second = get_skill_contents("owner/repo", "main", client=client)  # type: ignore[arg-type]
 
-    assert descs == {"foo": "Foo", "bar": "Bar"}
+    assert first == second
     assert client.requests == ["https://codeload.github.com/owner/repo/tar.gz/main"]

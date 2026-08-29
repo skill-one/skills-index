@@ -12,6 +12,7 @@ from .config import (
     DATA_DIR,
     FETCHED_SKILLS,
     INDEX_JSONL,
+    INDEX_META_JSON,
     JSON,
     MAX_SKILL_COUNT,
     SCANNED_REPOS,
@@ -162,10 +163,13 @@ def _build_summary(
         "### Artifacts",
         "- `data.tar.gz` — full `data/` tree",
         "- `index.jsonl` — merged skills index",
+        "- `index-meta.json` — index metadata (generatedAt / counts / format version)",
         "- `fetched-skills.jsonl` — raw skills.sh data",
         "- `scanned-repos.jsonl` — per-repo scan summary (scan order)",
-        "- `scanned-repos-by-stars.jsonl` — per-repo scan summary (sorted by stars)",
-        "- `scanned-repos-by-skillcount.jsonl` — per-repo scan summary (sorted by skillCount)",
+        "- `scanned-repos-by-stars.jsonl` — same rows, sorted by stars "
+        "(generated at publish time)",
+        "- `scanned-repos-by-skillcount.jsonl` — same rows, sorted by skillCount "
+        "(generated at publish time)",
     ]
     return "\n".join(lines) + "\n"
 
@@ -183,6 +187,7 @@ def clean_workspace() -> None:
     for root_file in (
         FETCHED_SKILLS,
         INDEX_JSONL,
+        INDEX_META_JSON,
         SCANNED_REPOS,
         SCANNED_REPOS_BY_STARS,
         SCANNED_REPOS_BY_SKILLCOUNT,
@@ -234,12 +239,21 @@ def main(argv: list[str] | None = None) -> int:
         skills, fetch_sum = run_fetch(max_pages=args.pages)
         if incremental:
             # Drop by-source dirs whose repo vanished from this fetch so their
-            # stale scanned.jsonl cannot leak into index.jsonl.
+            # stale scanned.jsonl cannot leak into index.jsonl. A fetch with
+            # failed pages is incomplete — pruning against it would delete
+            # the caches of repos that merely sat on a failed page — so only
+            # prune after a clean, complete fetch.
             sources = {str(s.get("source", "")).strip() for s in skills}
-            fetch_sum["pruned_stale"] = prune_stale_repos(sources)
-            print(
-                f"  [prune] removed {fetch_sum['pruned_stale']} stale repo dir(s)"
-            )
+            if fetch_sum.get("failed_pages"):
+                print(
+                    f"  [prune] skipped: {len(fetch_sum['failed_pages'])} page(s) "
+                    "failed; keeping all cached repo dirs"
+                )
+            else:
+                fetch_sum["pruned_stale"] = prune_stale_repos(sources)
+                print(
+                    f"  [prune] removed {fetch_sum['pruned_stale']} stale repo dir(s)"
+                )
         t_after_fetch = time.monotonic()
         scan_sum = scan_repositories(
             force=args.force,
@@ -266,7 +280,8 @@ def main(argv: list[str] | None = None) -> int:
         print("wrote data/run-summary.md")
         return 0
 
-    return 2
+    # argparse with required=True makes every other value unreachable.
+    raise AssertionError(f"unhandled command: {args.command}")
 
 
 if __name__ == "__main__":

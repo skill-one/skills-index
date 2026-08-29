@@ -5,27 +5,41 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any
 
 # JSON payloads are dynamically shaped; we do not over-constrain them.
 JSON = Any
 
 # --- Paths (derived from this package location, no dependency on CWD) ---
+# data/ 按来源分三层：skills-sh/（第1步 fetch 的 skills.sh 榜单数据）、
+# github/（第2步 scan 的仓库扫描数据，含 per-repo 增量缓存 by-source/）、
+# index/（第3步合并后的最终产物）。文件名即 Release 资产名（扁平），改动
+# 文件名会破坏既有消费者的下载 URL；移动目录则无影响。
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 DATA_DIR = ROOT / "data"
-BY_SOURCE_DIR = DATA_DIR / "by-source"
 
-# fetch 的中间产物（skills.sh 原始数据汇总）；最终索引 index.jsonl 由 index 步骤生成
-FETCHED_SKILLS = DATA_DIR / "fetched-skills.jsonl"
+# 第1步：skills.sh 内容
+SKILLS_SH_DIR = DATA_DIR / "skills-sh"
+# fetch 的中间产物（skills.sh 原始数据汇总）
+FETCHED_SKILLS = SKILLS_SH_DIR / "fetched-skills.jsonl"
+
+# 第2步：GitHub 仓库扫描内容
+GITHUB_DIR = DATA_DIR / "github"
+BY_SOURCE_DIR = GITHUB_DIR / "by-source"
+# scan 的汇总产物：原始扫描顺序（每个仓库一行，含更新时间、技能数量、技能路径）；由 `scan` 命令生成
+SCANNED_REPOS = GITHUB_DIR / "scanned-repos.jsonl"
+# 以下两个排序视图由 CI 在发布阶段生成（stars / skillCount 降序，见 daily.yml），
+# 核心流水线不产出；这里登记路径供 `clean_workspace` 清理本地的过期副本。
+SCANNED_REPOS_BY_STARS = GITHUB_DIR / "scanned-repos-by-stars.jsonl"
+SCANNED_REPOS_BY_SKILLCOUNT = GITHUB_DIR / "scanned-repos-by-skillcount.jsonl"
+
+# 第3步：最终合并产物
+INDEX_DIR = DATA_DIR / "index"
 # 最终合并产物（fetch + scan 结合），由 `index` 命令生成（以 skill 为单位平铺）
-INDEX_JSONL = DATA_DIR / "index.jsonl"
-# scan 的汇总产物：原始扫描顺序（每个仓库一行，含更新时间、技能数量、技能详情）；由 `scan` 命令生成
-SCANNED_REPOS = DATA_DIR / "scanned-repos.jsonl"
-# 按 star 数降序排列的扫描汇总
-SCANNED_REPOS_BY_STARS = DATA_DIR / "scanned-repos-by-stars.jsonl"
-# 按安装 skills 技能数（skillCount）降序排列的扫描汇总
-SCANNED_REPOS_BY_SKILLCOUNT = DATA_DIR / "scanned-repos-by-skillcount.jsonl"
+INDEX_JSONL = INDEX_DIR / "index.jsonl"
+# index.jsonl 的自描述元数据（生成时间 / 计数 / 格式版本），随 Release 与 dist 分支发布
+INDEX_META_JSON = INDEX_DIR / "index-meta.json"
 
 # 仓库 skillCount 过滤上限：scan 与 index 均会丢弃 skillCount > MAX_SKILL_COUNT
 # 的仓库（例如聚合型 / awesome-list 类仓库会捆绑过量技能，稀释索引质量）。
@@ -89,7 +103,6 @@ SKILLS_API = "https://skills.sh/api/skills/all-time"
 GITHUB_API = "https://api.github.com"
 
 # --- File names produced per repository under data/by-source/<owner>__<repo>/ ---
-FETCHED_FILE = "fetched.jsonl"
 SCANNED_FILE = "scanned.jsonl"
 META_FILE = "meta.json"
 
@@ -102,23 +115,19 @@ SCHEMA_VERSION = 4
 # reconstruct the GitHub directory URL from `source` + `path` (see README).
 KEEP_FIELDS: set[str] = {"source", "skillId", "installs", "weeklyInstalls"}
 
+# Version of the published index format (index.jsonl + index-meta.json).
+# Bump when the record shape or field semantics change; consumers read it
+# from index-meta.json to detect incompatible snapshots.
+INDEX_FORMAT_VERSION = 1
+
 # A GitHub source is `owner/repo` (contains a slash, is not a full URL).
 GITHUB_SOURCE = re.compile(r"^[^/\s]+/[^/\s]+$")
 
-# Directory separator replacement. Double underscore is safe because GitHub
-# owners/repos never contain a run of two underscores, so the mapping is
-# lossless: `owner/repo` <-> `owner__repo`.
+# Directory separator replacement. The mapping is reversible: `dir_to_source`
+# splits on the FIRST separator, so repo names containing `__` round-trip
+# correctly (`owner/my__repo` <-> `owner__my__repo`). GitHub owner names cannot
+# contain underscores at all, so the first separator is always the real one.
 DIR_SEP = "__"
-
-
-class Skill(TypedDict, total=False):
-    """A single skill record (subset of fields we persist)."""
-
-    source: str
-    skillId: str
-    installs: int
-    weeklyInstalls: list[int]
-    path: str
 
 
 def source_to_dir(source: str) -> str:
@@ -132,17 +141,19 @@ def dir_to_source(dir_name: str) -> str:
 
 
 def iter_repo_dirs(base_dir: Path) -> list[str]:
-    """Return sorted repo dir names under `base_dir` (exactly one ``DIR_SEP``).
+    """Return sorted repo dir names under `base_dir` (any name with ``DIR_SEP``).
 
-    A real GitHub source is ``owner/repo`` (single slash) -> ``owner__repo``
-    (single ``DIR_SEP``). Deeper slashes are not supported and are skipped.
+    `source_to_dir` maps `owner/repo` -> `owner__repo`; `dir_to_source` splits
+    on the first separator, so the mapping stays reversible even for repo
+    names containing `__` — those must not be silently skipped. Dirs without
+    a separator are unrelated files and are ignored.
     """
     if not base_dir.exists():
         return []
     return sorted(
         d.name
         for d in base_dir.iterdir()
-        if d.is_dir() and d.name.count(DIR_SEP) == 1
+        if d.is_dir() and DIR_SEP in d.name
     )
 
 

@@ -106,6 +106,7 @@ def test_clean_workspace_wipes_stale_artifacts(
     (stale_repo / "scanned.jsonl").write_text("{}")
     (data / "fetched-skills.jsonl").write_text("{}")
     (data / "index.jsonl").write_text("{}")
+    (data / "index-meta.json").write_text("{}")
     (data / "scanned-repos.jsonl").write_text("{}")
     (data / "scanned-repos-by-stars.jsonl").write_text("{}")
     (data / "scanned-repos-by-skillcount.jsonl").write_text("{}")
@@ -114,6 +115,7 @@ def test_clean_workspace_wipes_stale_artifacts(
     monkeypatch.setattr(cli, "BY_SOURCE_DIR", by_source)
     monkeypatch.setattr(cli, "FETCHED_SKILLS", data / "fetched-skills.jsonl")
     monkeypatch.setattr(cli, "INDEX_JSONL", data / "index.jsonl")
+    monkeypatch.setattr(cli, "INDEX_META_JSON", data / "index-meta.json")
     monkeypatch.setattr(cli, "SCANNED_REPOS", data / "scanned-repos.jsonl")
     by_stars = data / "scanned-repos-by-stars.jsonl"
     monkeypatch.setattr(cli, "SCANNED_REPOS_BY_STARS", by_stars)
@@ -124,6 +126,7 @@ def test_clean_workspace_wipes_stale_artifacts(
 
     assert not (data / "fetched-skills.jsonl").exists()
     assert not (data / "index.jsonl").exists()
+    assert not (data / "index-meta.json").exists()
     assert not (data / "scanned-repos.jsonl").exists()
     assert not (data / "scanned-repos-by-stars.jsonl").exists()
     assert not (data / "scanned-repos-by-skillcount.jsonl").exists()

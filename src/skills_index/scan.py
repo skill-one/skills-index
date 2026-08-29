@@ -20,8 +20,6 @@ from .config import (
     META_FILE,
     SCANNED_FILE,
     SCANNED_REPOS,
-    SCANNED_REPOS_BY_SKILLCOUNT,
-    SCANNED_REPOS_BY_STARS,
     SCHEMA_VERSION,
     dir_to_source,
     iter_repo_dirs,
@@ -30,73 +28,36 @@ from .config import (
 
 # META_FILE holds GitHub-sourced metadata (branch / pushedAt / stars / skillCount).
 from .github import (
+    extract_description,
     get_repo_metas,
-    get_skill_blobs,
-    get_skill_descriptions,
+    get_skill_contents,
     get_tree_shas,
 )
 from .http import new_github_client
 from .io_utils import read_json, read_jsonl, write_json, write_jsonl
-
-
-def plan_blob_fetches(
-    blobs: dict[str, tuple[str, str]],
-    prev_shas: dict[str, str],
-    *,
-    force: bool,
-    schema_upgrade: bool,
-) -> dict[str, tuple[str, str]]:
-    """Return the blobs whose SKILL.md description must be (re)fetched.
-
-    A schema upgrade or `--force` refetches everything; otherwise only blobs
-    whose sha differs from the previous scan are fetched (file-level
-    incremental), so untouched skills are never re-downloaded.
-    """
-    if force or schema_upgrade:
-        return dict(blobs)
-    return {
-        name: (path, sha)
-        for name, (path, sha) in blobs.items()
-        if prev_shas.get(path) != sha
-    }
-
-
-def merge_skill_records(  # noqa: E501
-    blobs: dict[str, tuple[str, str]],
-    descriptions: dict[str, str],
-    old_records: list[JSON],
-    prev_shas: dict[str, str],
-    *,
-    force: bool,
-    schema_upgrade: bool,
-) -> list[JSON]:
-    """Rebuild a repo's scanned.jsonl records from the current git tree.
-
-    Untouched skills keep their old record; changed/new ones are rebuilt from
-    the freshly fetched `descriptions`; paths that vanished from the tree are
-    dropped. Records are sorted by path for stable output.
-    """
-    old = {str(rec.get("path", "")): rec for rec in old_records}
-    out: list[JSON] = []
-    for name, (path, sha) in blobs.items():
-        if (
-            not force
-            and not schema_upgrade
-            and old.get(path)
-            and prev_shas.get(path) == sha
-        ):
-            out.append(old[path])
-        else:
-            out.append({"path": path, "description": descriptions.get(name, "")})
-    out.sort(key=lambda rec: str(rec.get("path", "")))
-    return out
-
 
 # Concurrency for repo-level scanning. GitHub requests are I/O-bound, so a
 # thread pool overlaps network waits across repos. Capped at 8 to stay friendly
 # to GitHub's secondary per-token concurrency limits; the rate-limit-aware
 # backoff in http.py absorbs any 429/403 spikes this may trigger.
 SCAN_WORKERS = 8
+
+
+def build_skill_records(
+    blobs: dict[str, tuple[str, str]],
+    contents: dict[str, str],
+) -> list[JSON]:
+    """Build a repo's scanned.jsonl records from its tarball, sorted by path.
+
+    The tarball is already downloaded and parsed by `get_skill_contents`, so
+    every description is extracted locally — no per-file network fetches and
+    no sha-based subsetting needed (that only paid off when each SKILL.md was
+    fetched individually from the blob API).
+    """
+    return [
+        {"path": path, "description": extract_description(contents.get(path, ""))}
+        for _name, (path, _sha) in sorted(blobs.items(), key=lambda kv: kv[1][0])
+    ]
 
 
 def _scan_one_repo(
@@ -141,6 +102,24 @@ def _scan_one_repo(
     pushed, branch, stars = metas[source]
 
     prev = read_json(meta_path, default={}) or {}
+
+    # Tombstoned mirror (loser of a previous run's fingerprint dedup): while
+    # neither repo has pushed again, the two skill trees are still identical,
+    # so skip entirely — no tarball download. A push on either side, or the
+    # winner disappearing, invalidates the tombstone and falls through to a
+    # full rescan; the dedup pass then re-adjudicates (re-tombstone or keep).
+    dedup_into = str(prev.get("dedupedInto") or "")
+    if dedup_into and not force:
+        winner_meta = metas.get(dedup_into)
+        if (
+            winner_meta is not None
+            and winner_meta[0] == prev.get("winnerPushedAt")
+            and pushed == prev.get("pushedAt")
+        ):
+            bump("skipped")
+            print(f"  [dedup-skip] {source}: still a mirror of {dedup_into}")
+            return None
+
     schema_upgrade = prev.get("schemaVersion") != SCHEMA_VERSION
     up_to_date = (
         not force
@@ -150,8 +129,7 @@ def _scan_one_repo(
     )
     if up_to_date:
         # 已扫描过的仓库：仍受 skillCount 上限约束，避免聚合型仓库绕过上限。
-        cached = read_json(meta_path, default={}) or {}
-        cached_skill_count = cached.get("skillCount") or 0
+        cached_skill_count = prev.get("skillCount") or 0
         if effective_max > 0 and cached_skill_count > effective_max:
             bump("filtered")
             bump("filtered_high_skill")
@@ -187,32 +165,17 @@ def _scan_one_repo(
             return _summarize_repo(repo_dir, meta_path, source)
 
     try:
-        blobs, filtered_nonpublic = get_skill_blobs(source, branch, client=client)
+        blobs, contents, filtered_nonpublic = get_skill_contents(
+            source, branch, client=client
+        )
     except Exception as exc:
         print(f"  [skip] {source}: scan failed - {exc}")
         bump("failed")
         return None
     if filtered_nonpublic:
         bump("skills_filtered_nonpublic", filtered_nonpublic)
-    # File-level incremental: only fetch blobs whose sha changed.
-    fetch = plan_blob_fetches(
-        blobs, prev_shas, force=force, schema_upgrade=schema_upgrade
-    )
-    try:
-        descriptions = get_skill_descriptions(source, fetch, client=client)
-    except Exception as exc:
-        print(f"  [skip] {source}: description fetch failed - {exc}")
-        bump("failed")
-        return None
 
-    skills = merge_skill_records(
-        blobs,
-        descriptions,
-        read_jsonl(repo_dir / SCANNED_FILE),
-        prev_shas,
-        force=force,
-        schema_upgrade=schema_upgrade,
-    )
+    skills = build_skill_records(blobs, contents)
     write_jsonl(repo_dir / SCANNED_FILE, skills)
 
     meta = {
@@ -222,7 +185,6 @@ def _scan_one_repo(
         "stars": stars,
         "lastScanned": now,
         "skillCount": len(skills),
-        "truncated": False,
         "schemaVersion": SCHEMA_VERSION,
         "blobShas": {path: sha for _name, (path, sha) in blobs.items()},
     }
@@ -243,10 +205,7 @@ def _scan_one_repo(
     filtered_note = (
         f", {filtered_nonpublic} non-public filtered" if filtered_nonpublic else ""
     )
-    print(
-        f"  [scan] {source}: {len(skills)} skills "
-        f"({len(fetch)}/{len(blobs)} blobs fetched{filtered_note})"
-    )
+    print(f"  [scan] {source}: {len(skills)} skills{filtered_note}")
     return _summarize_repo(repo_dir, meta_path, source)
 
 
@@ -265,7 +224,8 @@ def scan_repositories(
     Returns a summary dict with counts for the run report.
     """
     client = new_github_client()
-    now = datetime.datetime.now(datetime.UTC).isoformat()
+    # Second-precision UTC ("...Z"), consistent with GitHub's pushedAt format.
+    now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     _t0 = time.monotonic()
     _meta_time = 0.0
     effective_max = MAX_SKILL_COUNT if max_skill_count is None else max_skill_count
@@ -340,9 +300,9 @@ def scan_repositories(
     repos = sorted(scanned.values(), key=_orig_key)
 
     # 内容指纹去重：整棵技能树（path + blob sha）完全一致的仓库是未分叉的
-    # fork / 镜像，每组仅保留星数最高者，其余移出汇总并删除缓存，避免重复
+    # fork / 镜像，每组仅保留星数最高者，其余墓碑化并移出汇总，避免重复
     # 技能进入 index。去重后的 repos 才是 index 步骤的真实输入。
-    repos, deduped = _dedup_repos(repos, base_dir)
+    repos, deduped = _dedup_repos(repos, base_dir, now=now)
     counters["deduped"] = len(deduped)
 
     # `total_skills` counts every skill in every *valid* repo that survived the
@@ -350,19 +310,10 @@ def scan_repositories(
     # the incremental skip). This is the true size of the scan side that step 3
     # merges against — not just the skills re-downloaded this run.
     counters["total_skills"] = sum(len(r.get("skills", [])) for r in repos)
-    # Repos without a star count sink to the end when sorted descending.
-    repos_by_stars = sorted(
-        repos, key=lambda r: r.get("stars") or 0, reverse=True
-    )
-    # Repos without a skillCount sink to the end when sorted descending.
-    repos_by_skillcount = sorted(
-        repos, key=lambda r: r.get("skillCount") or 0, reverse=True
-    )
 
-    # scanned-repos.jsonl is the raw scan order; the others are sorted views.
+    # scanned-repos.jsonl is the raw scan order (fetch order); sorted views
+    # (by stars / skillCount) are generated by CI at publish time.
     write_jsonl(SCANNED_REPOS, repos)
-    write_jsonl(SCANNED_REPOS_BY_STARS, repos_by_stars)
-    write_jsonl(SCANNED_REPOS_BY_SKILLCOUNT, repos_by_skillcount)
     print(
         f"scan done: skipped {counters['skipped']} unchanged, "
         f"tree-skipped {counters['tree_skipped']} skills-unchanged, "
@@ -371,12 +322,7 @@ def scan_repositories(
         f"(high-skill {counters['filtered_high_skill']}), "
         f"deduped {counters['deduped']}."
     )
-    print(
-        f"wrote {len(repos)} repos -> "
-        f"{SCANNED_REPOS.name} (scan order), "
-        f"{SCANNED_REPOS_BY_STARS.name} (by stars), "
-        f"{SCANNED_REPOS_BY_SKILLCOUNT.name} (by skillCount)"
-    )
+    print(f"wrote {len(repos)} repos -> {SCANNED_REPOS.name} (scan order)")
     _total = time.monotonic() - _t0
     print(
         f"[timer] scan: total={_total:.1f}s "
@@ -417,16 +363,22 @@ def _content_fingerprint(shas: dict[str, str]) -> str:
     return json.dumps(sorted(shas.items()), ensure_ascii=False)
 
 
-def _dedup_repos(repos: list[JSON], base_dir: Path) -> tuple[list[JSON], list[tuple[str, str]]]:
+def _dedup_repos(
+    repos: list[JSON], base_dir: Path, *, now: str
+) -> tuple[list[JSON], list[tuple[str, str]]]:
     """Drop mirror repos whose skill tree is byte-identical to another's.
 
     Two repos with the same {path: blob sha} map carry exactly the same
     SKILL.md files — an undiverged fork or copy. Within each identical group
     only the most-starred repo survives (fetch order breaks ties); the rest
-    are removed from the summary and their by-source cache is deleted so
-    their duplicate skills never reach index.jsonl. Repos with no skills have
-    no fingerprint and are never deduped. Returns ``(kept, [(loser, winner)])``.
+    are removed from the summary and tombstoned: their `scanned.jsonl` is
+    deleted and `meta.json` is replaced by a `dedupedInto` marker, so their
+    duplicate skills never reach index.jsonl and later runs skip them without
+    any network I/O (until either repo pushes again, which invalidates the
+    tombstone and triggers a rescan). Repos with no skills have no fingerprint
+    and are never deduped. Returns ``(kept, [(loser, winner)])``.
     """
+    pushed_at = {str(r.get("source", "")): r.get("pushedAt") for r in repos}
     groups: dict[str, list[JSON]] = {}
     for r in repos:
         meta_path = base_dir / source_to_dir(str(r.get("source", ""))) / META_FILE
@@ -449,9 +401,21 @@ def _dedup_repos(repos: list[JSON], base_dir: Path) -> tuple[list[JSON], list[tu
         return repos, []
 
     for loser, winner in sorted(losers.items()):
-        print(f"  [dedup] {loser}: identical skill tree to {winner}; removed")
+        print(f"  [dedup] {loser}: identical skill tree to {winner}; tombstoned")
         repo_dir = base_dir / source_to_dir(loser)
         if repo_dir.exists():
-            shutil.rmtree(repo_dir)
+            # 墓碑 meta 不带 blobShas：无效化后的重扫不会拿过期指纹走
+            # tree 预检，必定重新下载 tarball 全量裁决。
+            (repo_dir / SCANNED_FILE).unlink(missing_ok=True)
+            write_json(
+                repo_dir / META_FILE,
+                {
+                    "source": loser,
+                    "dedupedInto": winner,
+                    "winnerPushedAt": pushed_at.get(winner),
+                    "pushedAt": pushed_at.get(loser),
+                    "lastScanned": now,
+                },
+            )
     kept = [r for r in repos if str(r.get("source", "")) not in losers]
     return kept, sorted(losers.items())

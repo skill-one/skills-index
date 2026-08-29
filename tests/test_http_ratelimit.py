@@ -119,9 +119,11 @@ def test_get_json_404_raises_immediately_without_retries(monkeypatch):
 
     from skills_index.http import HttpError
 
-    # A 404 is definitive (repo/page does not exist): fail fast, no retries.
-    with pytest.raises(HttpError):
+    # A 404 is definitive (repo/page does not exist): fail fast, no retries,
+    # and the status is carried on the error for callers to branch on.
+    with pytest.raises(HttpError) as exc_info:
         get_json(_FakeClient(), "x")  # type: ignore[arg-type]
+    assert exc_info.value.status == 404
     assert calls["n"] == 1
 
 
@@ -141,6 +143,7 @@ def test_get_json_451_raises_immediately_without_retries(monkeypatch):
 
     # A 451 (legally blocked, e.g. DMCA takedown) is as definitive as a 404:
     # retrying cannot change the answer, so fail fast with a single request.
-    with pytest.raises(HttpError):
+    with pytest.raises(HttpError) as exc_info:
         get_json(_FakeClient(), "x")  # type: ignore[arg-type]
+    assert exc_info.value.status == 451
     assert calls["n"] == 1

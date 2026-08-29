@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 import pytest
 
+from skills_index import config
 from skills_index import index as index_mod
 from skills_index.io_utils import read_jsonl, write_jsonl
 
@@ -32,6 +35,7 @@ def _setup_data(
 def _patch_paths(monkeypatch: pytest.MonkeyPatch, fetched_path: Path, index_path: Path) -> None:
     monkeypatch.setattr(index_mod, "FETCHED_SKILLS", fetched_path)
     monkeypatch.setattr(index_mod, "INDEX_JSONL", index_path)
+    monkeypatch.setattr(index_mod, "INDEX_META_JSON", index_path.parent / "index-meta.json")
 
 
 def test_run_index_merges_scanned_into_fetched(
@@ -57,6 +61,38 @@ def test_run_index_merges_scanned_into_fetched(
     assert summary["scanned_merged"] == 1
     assert summary["not_in_repo"] == 1
     assert summary["scan_only"] == 0
+
+
+def test_run_index_writes_meta_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """index-meta.json 记录 generatedAt / counts / formatVersion / weeklyInstalls 语义。"""
+    fetched = [
+        {"source": "owner/repo", "skillId": "a", "installs": 1},
+        {"source": "owner/repo", "skillId": "b", "installs": 2},
+    ]
+    scanned = {
+        "owner__repo": [
+            {"path": "skills/a", "description": "A"},
+            {"path": "skills/gh-only", "description": "not on skills.sh"},
+        ]
+    }
+    fetched_path, index_path, by_source = _setup_data(tmp_path, fetched=fetched, scanned=scanned)
+    _patch_paths(monkeypatch, fetched_path, index_path)
+
+    records, _summary = index_mod.run_index(base_dir=by_source)
+
+    meta_path = index_path.parent / "index-meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert meta["formatVersion"] == config.INDEX_FORMAT_VERSION
+    # generatedAt 是秒级 UTC Z 格式。
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", meta["generatedAt"])
+    assert meta["counts"] == {
+        "total": len(records),
+        "withInstalls": 1,   # 只有 a 有榜单数据；gh-only 是 scan-only
+        "scanOnly": len(records) - 1,
+    }
+    assert meta["weeklyInstalls"] == {"order": "oldest-first", "maxWeeks": 8}
 
 
 def test_run_index_keeps_fetched_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

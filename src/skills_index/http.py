@@ -17,7 +17,16 @@ MAX_BACKOFF = 60.0  # cap a single backoff wait
 
 
 class HttpError(RuntimeError):
-    """Raised when a request fails after all retries."""
+    """Raised when a request fails after all retries.
+
+    `status` carries the definitive HTTP status when the failure is a
+    non-retryable answer (e.g. 404 = repo gone, 451 = blocked); it is None
+    when the request simply exhausted its retries.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def build_client(token: str = "", *, base_url: str = "") -> httpx.Client:
@@ -102,19 +111,17 @@ def get_json(client: httpx.Client, url: str) -> Any:
                 continue
             resp.raise_for_status()
             return resp.json()
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            if status in (404, 451):
-                # Definitive "not retryable" answers: 404 = does not exist
-                # (deleted/renamed repo, missing page); 451 = legally blocked
-                # (e.g. DMCA takedown). Retrying cannot change the outcome,
-                # so fail fast instead of burning 5 attempts with backoff.
-                raise HttpError(f"{status} on {url}") from exc
-            last_err = exc
-            wait = 2.0 * attempt
-            print(f"  [retry {attempt}/{RETRIES}] {url}: {exc}; sleeping {wait:.1f}s")
-            time.sleep(wait)
         except (httpx.HTTPError, ValueError) as exc:
+            # HTTPStatusError (a subclass) carrying a definitive 404/451 answer
+            # fails fast: retrying cannot change the outcome, so don't burn
+            # the remaining attempts with backoff.
+            status = (
+                exc.response.status_code
+                if isinstance(exc, httpx.HTTPStatusError)
+                else None
+            )
+            if status in (404, 451):
+                raise HttpError(f"{status} on {url}", status=status) from exc
             last_err = exc
             wait = 2.0 * attempt
             print(f"  [retry {attempt}/{RETRIES}] {url}: {exc}; sleeping {wait:.1f}s")

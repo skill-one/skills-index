@@ -55,9 +55,9 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
 
 ### F5 内容指纹镜像去重
 
-- **规则**：`scan::_dedup_repos` 把每个仓库的 `{path: blob_sha}` 技能树序列化为指纹；指纹全等 = 未分叉镜像，组内只留星数最高者，其余删缓存。
+- **规则**：`scan::_dedup_repos` 把每个仓库的 `{path: blob_sha}` 技能树序列化为指纹；指纹全等 = 未分叉镜像，组内只留星数最高者，其余**墓碑化**：删除 `scanned.jsonl`、`meta.json` 改写为 `dedupedInto` 标记（含双方 `pushedAt` 快照），技能不再进入索引；后续运行两仓均无新推送时直接跳过该仓库（零网络请求），任一方有推送或胜者消失则重新扫描并重新裁决。
 - **边界**：`skillCount == 0` 的仓库无指纹，不参与去重。
-- **计数**：`repos_deduped`。
+- **计数**：`repos_deduped`（仅本轮新去重的败者；墓碑跳过计入 `repos_skipped`，日志标记 `[dedup-skip]`）。
 
 ---
 
@@ -94,7 +94,7 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
 
 ### I1 孤儿技能（仓库有、榜单无）→ 保留
 
-`(source, 目录名)` 不在 skills.sh 榜单 → 仍写入 index.jsonl，`installs` 置 `0`、`weeklyInstalls` 置 `[]`，追加在末尾（有榜单数据的按排名在前）。计数：`scan_only`。
+`(source, 目录名)` 不在 skills.sh 榜单 → 仍写入 index.jsonl，但 `installs` / `weeklyInstalls` 字段**不出现**，追加在末尾（有榜单数据的按排名在前）。计数：`scan_only`。
 
 ### I2 榜单失配（榜单有、仓库无）→ 剔除
 
@@ -133,4 +133,4 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
 | `not_in_repo` | I2 |
 | `deduped_skills` | I3（命中时才显示） |
 
-Scan 汇总行的 breakdown check `skipped + updated + failed + gone + filtered == repos_total`（✓/⚠）用于校验仓库级过滤未漏计；`repos_deduped` 是 `skipped`/`updated` 的事后细分，不参与该恒等式。
+Scan 汇总行的 breakdown check `skipped + updated + failed + gone + filtered == repos_total`（✓/⚠）用于校验仓库级过滤未漏计；本轮新去重的败者已先计入 `skipped`/`updated` 再被移出汇总，`repos_deduped` 是其事后细分；历史墓碑的跳过直接计入 `skipped`——均不参与该恒等式的额外项。

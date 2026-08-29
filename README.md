@@ -44,11 +44,13 @@
 | 文件                                | 说明                                                                                                                     |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `index.jsonl`                       | 合并后的最终索引（以**技能**为单位平铺，**推荐直接消费这个**）                                                           |
-| `data.tar.gz`                       | 完整数据快照（含 `by-source/` 下所有仓库的 fetched / scanned / meta）                                                    |
+| `index-meta.json`                   | 索引自描述元数据：`generatedAt`（生成时间）、`counts`、`formatVersion`（字段变更时递增）                                 |
+| `data.tar.gz`                       | 完整数据快照（内部按 `skills-sh/` / `github/` / `index/` 分目录，含 `github/by-source/` 下的 scanned / meta 增量指纹）  |
 | `fetched-skills.jsonl`              | skills.sh 原始数据汇总（中间产物）                                                                                       |
 | `scanned-repos.jsonl`               | 按仓库汇总的扫描结果，**原始扫描顺序**（fetch 拉取到的顺序，未排序）                                                     |
 | `scanned-repos-by-stars.jsonl`      | 按 **star 数降序**排列的扫描结果                                                                                         |
 | `scanned-repos-by-skillcount.jsonl` | 按**安装 skills 技能数（`skillCount`）降序**排列的扫描结果                                                               |
+| `run-summary.md`                    | 本次运行报告（各阶段计数与耗时）                                                                                         |
 
 ## 如何获取与使用
 
@@ -74,7 +76,9 @@ curl -L -o data.tar.gz \
 > ```
 
 ```bash
-# 本地调试 / 想要最新：用 latest（注意 302 重定向、缓存不友好）
+# 本地调试 / 想要最新：用 latest（注意 302 重定向、缓存不友好）。
+# latest 永远指向完整的 data- 快照：冒烟 alpha- Release 均标记为
+# prerelease，不会成为 latest。
 curl -L -o index.jsonl \
   https://github.com/skill-one/skills-index/releases/latest/download/index.jsonl
 ```
@@ -85,11 +89,20 @@ curl -L -o index.jsonl \
 
 ```
 https://cdn.jsdelivr.net/gh/skill-one/skills-index@dist/index.jsonl
+https://cdn.jsdelivr.net/gh/skill-one/skills-index@dist/index-meta.json
 ```
 
 > `dist` 分支每次全量发布时强推覆盖，始终指向最新一次 `main` 上的快照；仅 `main` 发布，冒烟测试不会覆盖它。
 
 也可在仓库 Releases 页面选择任意历史快照按需下载。保留最近 10 个 Release，超出部分自动清理。
+
+---
+
+## 许可
+
+- **代码**（`src/`、`tests/`、CI 工作流等）按 [MIT](LICENSE) 发布。
+- **发布的数据产物**（`index.jsonl` / `index-meta.json` / `fetched-skills.jsonl` / `scanned-repos*.jsonl` / `data.tar.gz`）按 [CC0 1.0](LICENSE-DATA)（公有领域贡献）发布，可自由使用、修改与再分发，无需署名。
+- 索引中收录的每个技能仍受其上游仓库自身许可约束；安装前请查阅对应 `source` 仓库。
 
 ---
 

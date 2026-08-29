@@ -44,6 +44,39 @@ def test_prune_stale_repos_noop_when_nothing_stale(tmp_path: Path) -> None:
     assert (base / keep).exists()
 
 
+def test_update_skips_prune_when_fetch_had_failed_pages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A fetch with failed pages is incomplete: prune nothing.
+
+    Repos that merely sat on a failed page must not be treated as vanished —
+    pruning against a partial fetch would delete their cached fingerprints."""
+    seen: list[str] = []
+
+    def fake_fetch(*, max_pages: int = 0, token: str = "") -> tuple[list, dict]:
+        return [{"source": "a/b"}], {"failed_pages": [3]}
+
+    def fake_scan(*, force: bool = False, base_dir=None, **kwargs) -> dict:
+        seen.append("scan")
+        return {}
+
+    def fake_index(*, base_dir=None) -> tuple[list, dict]:
+        return [], {}
+
+    def fake_prune(sources, base_dir=None) -> int:
+        seen.append("prune")
+        return 0
+
+    monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cli, "run_fetch", fake_fetch)
+    monkeypatch.setattr(cli, "scan_repositories", fake_scan)
+    monkeypatch.setattr(cli, "run_index", fake_index)
+    monkeypatch.setattr(cli, "prune_stale_repos", fake_prune)
+
+    assert cli.main(["update"]) == 0
+    assert seen == ["scan"]  # fetch -> prune skipped -> scan -> index
+
+
 def test_update_pages_takes_clean_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """A partial fetch (--pages N) is not incremental: clean, no pruning."""
     seen: list[str] = []

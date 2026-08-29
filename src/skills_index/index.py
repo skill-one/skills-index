@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
+import datetime
 from pathlib import Path
 
 from .config import (
     BY_SOURCE_DIR,
     FETCHED_SKILLS,
+    INDEX_FORMAT_VERSION,
     INDEX_JSONL,
+    INDEX_META_JSON,
     JSON,
     SCANNED_FILE,
+    Record,
     dir_to_source,
     iter_repo_dirs,
 )
-from .io_utils import read_jsonl, write_jsonl
-
-Record = dict[str, JSON]
+from .io_utils import read_jsonl, write_json, write_jsonl
 
 # Column order for the emitted index.jsonl records.
 _INDEX_FIELD_ORDER = (
@@ -151,6 +153,26 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
     # 跨仓库重复（skillId + description 双匹配）只保留 installs 更高者。
     result, deduped = _dedup_skills(result)
     write_jsonl(INDEX_JSONL, result)
+
+    # Self-describing metadata for consumers: absolute generation time, the
+    # shape/semantics of weeklyInstalls, and a format version to detect
+    # incompatible snapshots without parsing every record.
+    with_installs = sum(1 for r in result if "installs" in r)
+    write_json(
+        INDEX_META_JSON,
+        {
+            "formatVersion": INDEX_FORMAT_VERSION,
+            "generatedAt": datetime.datetime.now(datetime.UTC).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            "counts": {
+                "total": len(result),
+                "withInstalls": with_installs,
+                "scanOnly": len(result) - with_installs,
+            },
+            "weeklyInstalls": {"order": "oldest-first", "maxWeeks": 8},
+        },
+    )
     summary["scanned_merged"] = len(matched)
     summary["scan_only"] = len(scan_only)
     summary["not_in_repo"] = len(fetched) - len(matched_keys)
