@@ -2,22 +2,14 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-.venv/
-
-# Local secrets
-.env
-
-# Tool caches
-.mypy_cache/
-.ruff_cache/
-.pytest_cache/
-.coverage
 htmlcov/
 
-# IDE internal data
-.codebuddy/
+# Dot-entries are ignored by default (tool caches, IDE state, local secrets
+# like .env); whitelist the few that are meant to be versioned.
+.*
+!/.gitignore
+!/.github/
 
 # Generated dataset (published via GitHub Releases, not committed)
 data/
-# Per-repo incremental scan cache (published as cache.tar.gz, not committed)
 cache/
