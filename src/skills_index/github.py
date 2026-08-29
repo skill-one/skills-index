@@ -25,25 +25,15 @@ from .http import HttpError, get_json, new_github_client
 CODELOAD = "https://codeload.github.com"
 
 
-# Process-wide cache (valid for a single run only), keyed by source only so the
-# chosen httpx.Client is never pinned in the cache (avoids leaking connections
-# and keeps the key stable regardless of which caller-supplied client is used).
-_repo_info_cache: dict[str, tuple[str, str, int]] = {}
-
-
 def _repo_info(source: str, *, client: httpx.Client | None = None) -> tuple[str, str, int]:
-    """Return (pushed_at, default_branch, stars) for `source`, cached for the run."""
-    cached = _repo_info_cache.get(source)
-    if cached is not None:
-        return cached
+    """Return (pushed_at, default_branch, stars) for `source`."""
     owner, repo = _split(source)
     c = client or new_github_client()
     data = get_json(c, f"/repos/{owner}/{repo}")
     pushed = data.get("pushed_at") or data.get("updated_at") or ""
     branch = str(data.get("default_branch", "main"))
     stars = int(data.get("stargazers_count") or 0)
-    _repo_info_cache[source] = (pushed, branch, stars)
-    return _repo_info_cache[source]
+    return pushed, branch, stars
 
 
 def _split(source: str) -> tuple[str, str]:
@@ -60,23 +50,52 @@ def _git_blob_sha(content: bytes) -> str:
     return hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
 
 
-# Per-run cache: source -> (blobs, contents, filtered_count). Populated once
-# per repo by the first tarball download.
-#   blobs:    {basename: (relative_path, blob_sha)}
-#   contents: {relative_path: raw SKILL.md text}
-_tarball_scan: dict[str, tuple[dict[str, tuple[str, str]], dict[str, str], int]] = {}
+def _scan_repo(  # noqa: E501
+    source: str, branch: str, *, client: httpx.Client
+) -> tuple[dict[str, tuple[str, str]], dict[str, str], int]:
+    """Download and scan a repo tarball; return (blobs, contents, filtered)."""
+    owner, repo = _split(source)
+    url = f"{CODELOAD}/{owner}/{repo}/tar.gz/{quote(branch, safe='')}"
+    resp = client.get(url)
+    resp.raise_for_status()
+    return _parse_tarball(resp.content)
+
+
+def get_skill_contents(  # noqa: E501
+    source: str, branch: str = "HEAD", *, client: httpx.Client | None = None
+) -> tuple[dict[str, tuple[str, str]], dict[str, str], int]:
+    """Return (blobs, contents, filtered_count) for every public SKILL.md.
+
+    - blobs:    {basename: (relative_path, blob_sha)}
+    - contents: {relative_path: raw SKILL.md text}
+
+    Backed by a single codeload tarball download (not billed to the REST
+    quota); the blob sha is computed locally with git's exact algorithm, so
+    the repo-level fingerprints are comparable across runs and match the
+    Trees API shas used by `get_tree_shas`. SKILL.md files on internal paths
+    (tests/examples/...) or marked non-public are filtered out and counted in
+    the third value.
+    """
+    client = client or new_github_client()
+    return _scan_repo(source, branch, client=client)
 
 
 def get_tree_shas(
     source: str, branch: str, *, client: httpx.Client | None = None
 ) -> dict[str, str] | None:
-    """Return {relative_path: blob_sha} for every SKILL.md in the repo tree.
+    """Return {relative_path: blob_sha} for every public-path SKILL.md.
 
     One Trees API call (recursive) per repo — the sha values are identical to
     the locally computed `_git_blob_sha` fingerprints, so callers can compare
-    them against the cached `meta.json` blobShas to decide whether any
-    SKILL.md changed since the last scan (e.g. a README-only push would show
-    an unchanged set, and the tarball download can be skipped entirely).
+    them against the cached `meta.json` skillShas to decide whether any
+    public SKILL.md changed since the last scan (e.g. a README-only push
+    would show an unchanged set, and the tarball download can be skipped
+    entirely). Internal paths (tests/examples/... — see
+    `is_internal_skill_path`) are excluded so the comparison domain matches
+    the cached fingerprint, which only covers public skills; SKILL.md files
+    hidden via frontmatter markers cannot be recognized from the tree alone,
+    so repos carrying those simply never hit the pre-check (conservative:
+    they fall through to the tarball).
 
     Returns `None` when the tree is truncated (>100k entries / 7MB response)
     or the request fails: the caller should fall back to downloading the
@@ -89,9 +108,11 @@ def get_tree_shas(
         print(f"  [tree] {source}: tree truncated; falling back to tarball")
         return None
     return {
-        e["path"]: e["sha"]
+        e["path"][: -len("/SKILL.md")]: e["sha"]
         for e in data.get("tree", [])
-        if e.get("type") == "blob" and e.get("path", "").endswith("/SKILL.md")
+        if e.get("type") == "blob"
+        and e.get("path", "").endswith("/SKILL.md")
+        and not is_internal_skill_path(e["path"][: -len("/SKILL.md")])
     }
 
 
@@ -137,42 +158,6 @@ def _parse_tarball(  # noqa: E501
             blobs[skill_dir.rsplit("/", 1)[-1]] = (skill_dir, _git_blob_sha(data))
             contents[skill_dir] = text
     return blobs, contents, filtered
-
-
-def _scan_repo(  # noqa: E501
-    source: str, branch: str, *, client: httpx.Client
-) -> tuple[dict[str, tuple[str, str]], dict[str, str], int]:
-    """Download (once) and scan a repo tarball; return (blobs, contents, filtered)."""
-    cached = _tarball_scan.get(source)
-    if cached is not None:
-        return cached
-    owner, repo = _split(source)
-    url = f"{CODELOAD}/{owner}/{repo}/tar.gz/{quote(branch, safe='')}"
-    resp = client.get(url)
-    resp.raise_for_status()
-    result = _parse_tarball(resp.content)
-    _tarball_scan[source] = result
-    return result
-
-
-def get_skill_contents(  # noqa: E501
-    source: str, branch: str = "HEAD", *, client: httpx.Client | None = None
-) -> tuple[dict[str, tuple[str, str]], dict[str, str], int]:
-    """Return (blobs, contents, filtered_count) for every public SKILL.md.
-
-    - blobs:    {basename: (relative_path, blob_sha)}
-    - contents: {relative_path: raw SKILL.md text}
-
-    Backed by a single codeload tarball download (not billed to the REST
-    quota); the blob sha is computed locally with git's exact algorithm, so
-    the repo-level fingerprints are comparable across runs and match the
-    Trees API shas used by `get_tree_shas`. SKILL.md files on internal paths
-    (tests/examples/...) or marked non-public are filtered out and counted in
-    the third value. The tarball is cached per run, so later calls for the
-    same source perform no network I/O.
-    """
-    client = client or new_github_client()
-    return _scan_repo(source, branch, client=client)
 
 
 def parse_frontmatter(markdown: str) -> dict[str, JSON]:

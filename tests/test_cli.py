@@ -12,18 +12,50 @@ from skills_index import cli
 
 def test_parser_has_all_subcommands() -> None:
     parser = cli.build_parser()
-    # Every known command is registered as a subparser choice.
-    assert set(parser._subparsers._group_actions[0].choices) == {  # type: ignore[attr-defined]
-        "fetch",
-        "scan",
-        "index",
-        "update",
-    }
+    # Each known command parses and tags args.command (no private internals).
+    for command in ("fetch", "scan", "index", "update"):
+        args = parser.parse_args([command])
+        assert args.command == command
 
 
-def test_update_runs_pipeline_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_forwards_args_to_fetch_scan_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fetch / scan / index subcommands dispatch with their args forwarded."""
+    seen: dict[str, dict] = {}
+
+    def fake_fetch(*, max_pages: int = 0, token: str = "") -> tuple[list, dict]:
+        seen["fetch"] = {"max_pages": max_pages}
+        return [], {}
+
+    def fake_scan(*, force: bool = False, max_skill_count=None) -> dict:
+        seen["scan"] = {"force": force, "max_skill_count": max_skill_count}
+        return {}
+
+    def fake_index() -> tuple[list, dict]:
+        seen["index"] = {"called": True}
+        return [], {}
+
+    monkeypatch.setattr(cli, "run_fetch", fake_fetch)
+    monkeypatch.setattr(cli, "scan_repositories", fake_scan)
+    monkeypatch.setattr(cli, "run_index", fake_index)
+
+    assert cli.main(["fetch", "--pages", "3"]) == 0
+    assert cli.main(["scan", "--force", "--max-skill-count", "7"]) == 0
+    assert cli.main(["index"]) == 0
+
+    assert seen["fetch"] == {"max_pages": 3}
+    assert seen["scan"] == {"force": True, "max_skill_count": 7}
+    assert seen["index"] == {"called": True}
+
+
+def test_update_runs_pipeline_in_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """`update` calls clean -> fetch -> scan -> index with args forwarded correctly."""
     calls: list[tuple[str, dict]] = []
+    # Keep the run report out of the real data/ dir.
+    monkeypatch.setattr(cli, "RUN_SUMMARY", tmp_path / "run-summary.md")
 
     def fake_clean() -> None:
         calls.append(("clean", {}))
@@ -55,9 +87,13 @@ def test_update_runs_pipeline_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
     }
 
 
-def test_update_defaults_is_incremental(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_update_defaults_is_incremental(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Without flags, update keeps the cache: no clean, fetch all, prune stale."""
     seen: dict[str, dict] = {}
+    # Keep the run report out of the real data/ dir.
+    monkeypatch.setattr(cli, "RUN_SUMMARY", tmp_path / "run-summary.md")
 
     def fake_clean() -> None:
         seen["clean"] = {}
@@ -96,42 +132,40 @@ def test_update_defaults_is_incremental(monkeypatch: pytest.MonkeyPatch) -> None
 def test_clean_workspace_wipes_stale_artifacts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """clean_workspace removes root summaries and the whole per-source tree."""
+    """clean_workspace removes every registered published artifact and the
+    whole per-repo cache tree, leaving unregistered files alone."""
     data = tmp_path / "data"
-    by_source = data / "by-source"
-    by_source.mkdir(parents=True)
+    data.mkdir()
+    published = [
+        data / "fetched-skills.jsonl",
+        data / "index.jsonl",
+        data / "index-meta.json",
+        data / "scanned-repos.jsonl",
+        data / "scanned-repos-by-stars.jsonl",
+        data / "scanned-repos-by-skillcount.jsonl",
+        data / "run-summary.md",
+    ]
+    for path in published:
+        path.write_text("{}")
+    unregistered = data / "unregistered.txt"
+    unregistered.write_text("keep me")
+
+    by_source = tmp_path / "cache" / "by-source"
     stale_repo = by_source / "owner__repo"
-    stale_repo.mkdir()
+    stale_repo.mkdir(parents=True)
     (stale_repo / "meta.json").write_text(json.dumps({"pushedAt": "x"}))
     (stale_repo / "scanned.jsonl").write_text("{}")
-    (data / "fetched-skills.jsonl").write_text("{}")
-    (data / "index.jsonl").write_text("{}")
-    (data / "index-meta.json").write_text("{}")
-    (data / "scanned-repos.jsonl").write_text("{}")
-    (data / "scanned-repos-by-stars.jsonl").write_text("{}")
-    (data / "scanned-repos-by-skillcount.jsonl").write_text("{}")
 
-    monkeypatch.setattr(cli, "DATA_DIR", data)
+    monkeypatch.setattr(cli, "PUBLISHED_FILES", tuple(published))
     monkeypatch.setattr(cli, "BY_SOURCE_DIR", by_source)
-    monkeypatch.setattr(cli, "FETCHED_SKILLS", data / "fetched-skills.jsonl")
-    monkeypatch.setattr(cli, "INDEX_JSONL", data / "index.jsonl")
-    monkeypatch.setattr(cli, "INDEX_META_JSON", data / "index-meta.json")
-    monkeypatch.setattr(cli, "SCANNED_REPOS", data / "scanned-repos.jsonl")
-    by_stars = data / "scanned-repos-by-stars.jsonl"
-    monkeypatch.setattr(cli, "SCANNED_REPOS_BY_STARS", by_stars)
-    by_skillcount = data / "scanned-repos-by-skillcount.jsonl"
-    monkeypatch.setattr(cli, "SCANNED_REPOS_BY_SKILLCOUNT", by_skillcount)
 
     cli.clean_workspace()
 
-    assert not (data / "fetched-skills.jsonl").exists()
-    assert not (data / "index.jsonl").exists()
-    assert not (data / "index-meta.json").exists()
-    assert not (data / "scanned-repos.jsonl").exists()
-    assert not (data / "scanned-repos-by-stars.jsonl").exists()
-    assert not (data / "scanned-repos-by-skillcount.jsonl").exists()
-    # The per-source tree is wiped entirely (no stale repo dirs remain).
-    assert list(by_source.iterdir()) == []
+    assert all(not path.exists() for path in published)
+    # Only registered artifacts are removed.
+    assert unregistered.exists()
+    # The per-repo cache tree is wiped entirely (no stale repo dirs remain).
+    assert not by_source.exists()
 
 
 def test_unknown_command_returns_error() -> None:

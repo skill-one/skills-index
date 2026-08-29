@@ -9,15 +9,10 @@ import time
 
 from .config import (
     BY_SOURCE_DIR,
-    DATA_DIR,
-    FETCHED_SKILLS,
-    INDEX_JSONL,
-    INDEX_META_JSON,
     JSON,
     MAX_SKILL_COUNT,
-    SCANNED_REPOS,
-    SCANNED_REPOS_BY_SKILLCOUNT,
-    SCANNED_REPOS_BY_STARS,
+    PUBLISHED_FILES,
+    RUN_SUMMARY,
 )
 from .fetch import prune_stale_repos, run_fetch
 from .index import run_index
@@ -161,7 +156,9 @@ def _build_summary(
         f"- **Final index entries: `{index_sum.get('index', 0)}`**",
         "",
         "### Artifacts",
-        "- `data.tar.gz` — full `data/` tree",
+        "- `data.tar.gz` — published `data/` tree (no pipeline-internal state)",
+        "- `cache.tar.gz` — per-repo incremental scan cache (`cache/by-source/`, "
+        "restored by the next CI run)",
         "- `index.jsonl` — merged skills index",
         "- `index-meta.json` — index metadata (generatedAt / counts / format version)",
         "- `fetched-skills.jsonl` — raw skills.sh data",
@@ -180,32 +177,22 @@ def clean_workspace() -> None:
     `update` is a from-scratch pipeline: fetch -> scan -> index. Leftover files
     from an earlier run (e.g. a stale full scan on a machine that also ran a
     single-page test) would otherwise leak into `index.jsonl`, making the
-    published artifacts inconsistent with the fetched data. We wipe the root
-    summaries and every per-source intermediate file, but keep the directory
-    tree so fresh runs reconstruct it.
+    published artifacts inconsistent with the fetched data. Every published
+    artifact (config.PUBLISHED_FILES) is deleted, and the whole per-repo
+    cache tree (config.BY_SOURCE_DIR) is wiped so `scan` only ever processes
+    repos that `fetch` just wrote — keeping stale cache dirs would let their
+    cached skills leak into index.jsonl, desyncing it from the fetched data.
+    Incremental reuse is opt-in via the separate `fetch`/`scan`/`index`
+    commands or a plain `update`.
     """
-    for root_file in (
-        FETCHED_SKILLS,
-        INDEX_JSONL,
-        INDEX_META_JSON,
-        SCANNED_REPOS,
-        SCANNED_REPOS_BY_STARS,
-        SCANNED_REPOS_BY_SKILLCOUNT,
-    ):
-        if root_file.exists():
-            root_file.unlink()
-            print(f"[clean] removed {root_file.name}")
+    for path in PUBLISHED_FILES:
+        if path.exists():
+            path.unlink()
+            print(f"[clean] removed {path.name}")
 
-    # Wipe the entire per-source tree so `scan` only ever processes repos that
-    # `fetch` just wrote. Keeping stale dirs (with cached meta.json) would let
-    # their scanned skills leak into index.jsonl, desyncing it from the fetched
-    # data. `update` is a from-scratch pipeline; incremental reuse is opt-in via
-    # the separate `fetch`/`scan`/`index` commands.
     if BY_SOURCE_DIR.exists():
-        for repo_dir in BY_SOURCE_DIR.iterdir():
-            if repo_dir.is_dir():
-                shutil.rmtree(repo_dir)
-        print(f"[clean] wiped per-source tree under {BY_SOURCE_DIR.name}")
+        shutil.rmtree(BY_SOURCE_DIR)
+        print(f"[clean] wiped per-source cache under {BY_SOURCE_DIR.parent.name}/")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -228,8 +215,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "update":
         t_start = time.monotonic()
-        # Incremental (default): keep the on-disk by-source cache so `scan` can
-        # reuse pushed_at / blob sha fingerprints. A partial fetch (`--pages N`,
+        # Incremental (default): keep the on-disk per-repo cache so `scan` can
+        # reuse pushed_at / skill-sha fingerprints. A partial fetch (`--pages N`,
         # smoke tests) or `--force` falls back to the clean full-build path: a
         # partial fetch would otherwise prune most cached repos and break the
         # incremental chain, and `--force` promises a from-scratch rebuild.
@@ -276,8 +263,8 @@ def main(argv: list[str] | None = None) -> int:
             total=t_total, fetch=t_fetch, scan=t_scan, index=t_index,
             pages=args.pages,
         )
-        (DATA_DIR / "run-summary.md").write_text(summary)
-        print("wrote data/run-summary.md")
+        RUN_SUMMARY.write_text(summary)
+        print(f"wrote {RUN_SUMMARY.name}")
         return 0
 
     # argparse with required=True makes every other value unreachable.

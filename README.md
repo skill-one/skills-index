@@ -45,7 +45,8 @@
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `index.jsonl`                       | 合并后的最终索引（以**技能**为单位平铺，**推荐直接消费这个**）                                                           |
 | `index-meta.json`                   | 索引自描述元数据：`generatedAt`（生成时间）、`counts`、`formatVersion`（字段变更时递增）                                 |
-| `data.tar.gz`                       | 完整数据快照（内部按 `skills-sh/` / `github/` / `index/` 分目录，含 `github/by-source/` 下的 scanned / meta 增量指纹）  |
+| `data.tar.gz`                       | 完整数据快照（内部按 `skills-sh/` / `github/` / `index/` 分目录，仅含发布数据，不含流水线内部状态）                    |
+| `cache.tar.gz`                      | 增量扫描缓存（`cache/by-source/` 下的 per-repo 指纹），仅供下一轮 CI 恢复增量状态；数据消费者无需下载                   |
 | `fetched-skills.jsonl`              | skills.sh 原始数据汇总（中间产物）                                                                                       |
 | `scanned-repos.jsonl`               | 按仓库汇总的扫描结果，**原始扫描顺序**（fetch 拉取到的顺序，未排序）                                                     |
 | `scanned-repos-by-stars.jsonl`      | 按 **star 数降序**排列的扫描结果                                                                                         |

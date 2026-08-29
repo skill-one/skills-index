@@ -1,7 +1,8 @@
 """End-to-end tests for the codeload tarball scan path (no real network).
 
-Verifies that `get_skill_contents` downloads a repo tarball exactly once and
-caches the parsed result for the rest of the run.
+Verifies that `get_skill_contents` parses a repo tarball in one download and
+that `get_tree_shas` returns the {skill dir: blob sha} domain the scan step's
+tree pre-check compares against.
 """
 
 from __future__ import annotations
@@ -9,8 +10,7 @@ from __future__ import annotations
 import io
 import tarfile
 
-from skills_index import github
-from skills_index.github import get_skill_contents
+from skills_index.github import get_skill_contents, get_tree_shas
 
 
 def _make_tarball(files: dict[str, bytes]) -> bytes:
@@ -43,12 +43,7 @@ class _FakeClient:
         return _FakeResponse(self._content)
 
 
-def _reset_cache(monkeypatch) -> None:
-    monkeypatch.setattr(github, "_tarball_scan", {})
-
-
 def test_get_skill_contents_downloads_tarball_once(monkeypatch) -> None:
-    _reset_cache(monkeypatch)
     raw = _make_tarball(
         {
             "skills/foo/SKILL.md": b"---\ndescription: Foo\n---\n",
@@ -68,19 +63,65 @@ def test_get_skill_contents_downloads_tarball_once(monkeypatch) -> None:
     assert filtered == 1
 
 
-def test_get_skill_contents_caches_per_run(monkeypatch) -> None:
-    _reset_cache(monkeypatch)
-    raw = _make_tarball(
-        {
-            "skills/foo/SKILL.md": b"---\ndescription: Foo\n---\n",
-            "skills/bar/SKILL.md": b"---\ndescription: Bar\n---\n",
-        }
-    )
-    client = _FakeClient(raw)
+class _FakeJsonResponse:
+    def __init__(self, payload: dict) -> None:
+        self.status_code = 200
+        self._payload = payload
 
-    # A second call for the same source must reuse the cached tarball.
-    first = get_skill_contents("owner/repo", "main", client=client)  # type: ignore[arg-type]
-    second = get_skill_contents("owner/repo", "main", client=client)  # type: ignore[arg-type]
+    def json(self) -> dict:
+        return self._payload
 
-    assert first == second
-    assert client.requests == ["https://codeload.github.com/owner/repo/tar.gz/main"]
+    def raise_for_status(self) -> None:
+        pass
+
+
+class _FakeJsonClient:
+    """Serves a canned JSON payload and records requested URLs."""
+
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+        self.requests: list[str] = []
+
+    def get(self, url: str) -> _FakeJsonResponse:
+        self.requests.append(url)
+        return _FakeJsonResponse(self._payload)
+
+
+def test_get_tree_shas_keeps_only_public_skill_dirs(monkeypatch) -> None:
+    """返回 {技能目录: blob sha}（与缓存 skillShas 同域），内部路径被过滤，
+    agent 技能标准位置（.claude/skills 等）保留。"""
+    payload = {
+        "truncated": False,
+        "tree": [
+            {"type": "blob", "path": "skills/a/SKILL.md", "sha": "sha-a"},
+            {"type": "blob", "path": "README.md", "sha": "sha-readme"},
+            {"type": "tree", "path": "skills/a"},
+            {"type": "blob", "path": "skills/b/SKILL.md", "sha": "sha-b"},
+            # 内部路径（测试夹具 / 配置目录）：不进入比对域。
+            {"type": "blob", "path": "tests/x/SKILL.md", "sha": "sha-t"},
+            {"type": "blob", "path": ".github/skills/y/SKILL.md", "sha": "sha-g"},
+            # agent 工具的公开技能标准位置：保留。
+            {"type": "blob", "path": ".claude/skills/z/SKILL.md", "sha": "sha-c"},
+        ],
+    }
+    client = _FakeJsonClient(payload)
+
+    shas = get_tree_shas("owner/repo", "main", client=client)  # type: ignore[arg-type]
+
+    assert shas == {
+        "skills/a": "sha-a",
+        "skills/b": "sha-b",
+        ".claude/skills/z": "sha-c",
+    }
+    assert client.requests == ["/repos/owner/repo/git/trees/main?recursive=1"]
+
+
+def test_get_tree_shas_truncated_returns_none(monkeypatch) -> None:
+    """树截断（>100k 条目）时返回 None，调用方回退到 tarball 全量路径。"""
+    payload = {
+        "truncated": True,
+        "tree": [{"type": "blob", "path": "skills/a/SKILL.md", "sha": "x"}],
+    }
+    client = _FakeJsonClient(payload)
+
+    assert get_tree_shas("owner/repo", "main", client=client) is None  # type: ignore[arg-type]

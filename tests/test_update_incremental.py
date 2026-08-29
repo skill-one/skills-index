@@ -67,7 +67,7 @@ def test_update_skips_prune_when_fetch_had_failed_pages(
         seen.append("prune")
         return 0
 
-    monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cli, "RUN_SUMMARY", tmp_path / "run-summary.md")
     monkeypatch.setattr(cli, "run_fetch", fake_fetch)
     monkeypatch.setattr(cli, "scan_repositories", fake_scan)
     monkeypatch.setattr(cli, "run_index", fake_index)
@@ -77,9 +77,13 @@ def test_update_skips_prune_when_fetch_had_failed_pages(
     assert seen == ["scan"]  # fetch -> prune skipped -> scan -> index
 
 
-def test_update_pages_takes_clean_path(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_update_pages_takes_clean_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """A partial fetch (--pages N) is not incremental: clean, no pruning."""
     seen: list[str] = []
+    # Keep the run report out of the real data/ dir.
+    monkeypatch.setattr(cli, "RUN_SUMMARY", tmp_path / "run-summary.md")
 
     def fake_clean() -> None:
         seen.append("clean")
@@ -109,9 +113,13 @@ def test_update_pages_takes_clean_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert seen == ["clean", "fetch:1", "scan"]
 
 
-def test_update_force_takes_clean_path(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_update_force_takes_clean_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """--force is not incremental: clean first, then rescan everything."""
     seen: list[str] = []
+    # Keep the run report out of the real data/ dir.
+    monkeypatch.setattr(cli, "RUN_SUMMARY", tmp_path / "run-summary.md")
 
     def fake_clean() -> None:
         seen.append("clean")

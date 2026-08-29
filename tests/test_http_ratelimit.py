@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 import skills_index.http as http_mod
-from skills_index.http import _rate_limit_sleep, get_json
+from skills_index.http import _rate_limit_sleep, build_client, get_json
 
 
 class _FakeResponse:
@@ -33,9 +33,39 @@ def test_non_ratelimit_status_returns_none():
     assert _rate_limit_sleep(_FakeResponse(403)) is None
 
 
+def test_build_client_sets_ua_and_bearer_auth():
+    client = build_client("tok-123")
+    try:
+        assert client.headers["User-Agent"] == "skills-index"
+        assert client.headers["Authorization"] == "Bearer tok-123"
+    finally:
+        client.close()
+
+
+def test_build_client_without_token_has_no_auth_header():
+    client = build_client()
+    try:
+        assert "Authorization" not in client.headers
+        assert client.headers["Accept"].startswith("application/vnd.github")
+    finally:
+        client.close()
+
+
 def test_retry_after_header_is_honoured():
     resp = _FakeResponse(429, headers={"Retry-After": "12"})
     assert _rate_limit_sleep(resp) == 12.0
+
+
+def test_retry_after_is_capped_at_max_backoff():
+    # A server asking for hours of patience must not stall the pipeline.
+    resp = _FakeResponse(429, headers={"Retry-After": "999999"})
+    assert _rate_limit_sleep(resp) == http_mod.MAX_BACKOFF
+
+
+def test_non_numeric_retry_after_falls_through():
+    # 429 with a garbage Retry-After: no header-based wait, generic backoff.
+    resp = _FakeResponse(429, headers={"Retry-After": "soon"})
+    assert _rate_limit_sleep(resp) == 0.0
 
 
 def test_x_ratelimit_reset_is_honoured(monkeypatch):

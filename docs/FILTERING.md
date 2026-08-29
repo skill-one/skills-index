@@ -15,7 +15,7 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
 | F1 | 排行榜入口门槛 | `fetch` | 必须出现在 skills.sh all-time 榜单 |
 | F2 | 非 GitHub 源 | `fetch::filter_github` | source 不是 `owner/repo` 形式即丢弃 |
 | F3 | 仓库已不存在 | `scan::_scan_one_repo` | GitHub 404 → 删除该仓库全部缓存数据 |
-| F4 | 高技能数仓库 | `scan::_scan_one_repo` | skillCount > 500（聚合型仓库）→ 丢弃并删缓存 |
+| F4 | 高技能数仓库 | `scan::_scan_one_repo` | skillCount > 500（聚合型仓库）→ 丢弃并墓碑化缓存 |
 | F5 | 内容指纹镜像去重 | `scan::_dedup_repos` | 整棵技能树 blob sha 全等 → 只留星数最高者 |
 | S1 | 文件名约定 | `github::_parse_tarball` | 只收集 `…/SKILL.md`，其余文件一律忽略 |
 | S2 | 内部路径过滤 | `config::is_internal_skill_path` | SKILL.md 位于仓库内部目录 → 丢弃 |
@@ -42,20 +42,20 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
 
 ### F3 仓库已不存在（404）
 
-- **规则**：GitHub 返回 404（已删除/改名/转私有）→ 删除 `by-source/<owner>__<repo>/` 全部缓存，仓库及其技能从索引消失。
+- **规则**：GitHub 返回 404（已删除/改名/转私有）→ 删除 `cache/by-source/<owner>__<repo>/` 全部缓存，仓库及其技能从索引消失。
 - **判定**：`github::_is_missing_repo` 沿异常链查 404，与网络错误/5xx/限流区分——后者只跳过本次，不删数据。
 - **计数**：`repos_gone`。
 
 ### F4 高技能数仓库（聚合商过滤）
 
-- **规则**：`skillCount` > `MAX_SKILL_COUNT`（默认 **500**）→ 整仓库丢弃并删缓存。
+- **规则**：`skillCount` > `MAX_SKILL_COUNT`（默认 **500**）→ 整仓库丢弃，缓存**墓碑化**（`scanned.jsonl` 删除，`meta.json` 保留 `pushedAt` + `skillCount`）：后续运行在仓库无新推送时免 tarball 直接跳过，有新推送（可能回到上限以内）则重新全量裁决。
 - **可调**：`--max-skill-count N` 覆盖，`0` 关闭。
-- **覆盖增量分支**：`pushed_at` 未变化的仓库用缓存 `meta.json` 的 `skillCount` 复查，规则收紧后仍会被过滤。
+- **覆盖增量分支**：`pushed_at` 未变化的 `ok` 缓存仓库用缓存 `meta.json` 的 `skillCount` 复查，规则收紧后仍会被过滤（转为墓碑）。
 - **计数**：`repos_filtered` / `repos_filtered_high_skill`。
 
 ### F5 内容指纹镜像去重
 
-- **规则**：`scan::_dedup_repos` 把每个仓库的 `{path: blob_sha}` 技能树序列化为指纹；指纹全等 = 未分叉镜像，组内只留星数最高者，其余**墓碑化**：删除 `scanned.jsonl`、`meta.json` 改写为 `dedupedInto` 标记（含双方 `pushedAt` 快照），技能不再进入索引；后续运行两仓均无新推送时直接跳过该仓库（零网络请求），任一方有推送或胜者消失则重新扫描并重新裁决。
+- **规则**：`scan::_dedup_repos` 把每个仓库的 `{path: blob_sha}` 技能树序列化为指纹；指纹全等 = 未分叉镜像，组内只留星数最高者，其余**墓碑化**（`status: tombstoned`）：删除 `scanned.jsonl`、`meta.json` 改写为 `dedupedInto` 标记（含双方 `pushedAt` 快照），技能不再进入索引；后续运行两仓均无新推送时直接跳过该仓库（零网络请求），任一方有推送或胜者消失则重新扫描并重新裁决。
 - **边界**：`skillCount == 0` 的仓库无指纹，不参与去重。
 - **计数**：`repos_deduped`（仅本轮新去重的败者；墓碑跳过计入 `repos_skipped`，日志标记 `[dedup-skip]`）。
 
@@ -114,7 +114,7 @@ skills.sh API ──▶ [fetch] ──▶ [scan] ──▶ [index] ──▶ ind
 | `SKILL_EXCLUDE_DIRS` | 结构词集合 | S2 中间目录段排除词 |
 | `SKILL_EXCLUDE_ANY_DIRS` | 状态词集合 | S2 任意段排除词（含技能名） |
 | `HIDDEN_FRONTMATTER_MARKERS` | 状态词元组 | S3 frontmatter 非公开标记 |
-| `SCHEMA_VERSION` | `4` | 过滤规则变更时递增 → 触发存量缓存一次性全量重扫 |
+| `SCHEMA_VERSION` | `5` | 过滤规则变更时递增 → 触发存量缓存一次性全量重扫 |
 
 > 修改任何过滤规则后应递增 `SCHEMA_VERSION`：增量模式下旧缓存按旧规则生成，只有版本号变化才会强制重建。
 

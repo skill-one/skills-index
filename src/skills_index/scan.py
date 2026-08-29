@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime
 import json
-import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -12,21 +11,17 @@ from pathlib import Path
 
 import httpx
 
+from .cache import RepoCache
 from .config import (
     BY_SOURCE_DIR,
     FETCHED_SKILLS,
     JSON,
     MAX_SKILL_COUNT,
-    META_FILE,
-    SCANNED_FILE,
     SCANNED_REPOS,
-    SCHEMA_VERSION,
     dir_to_source,
     iter_repo_dirs,
     source_to_dir,
 )
-
-# META_FILE holds GitHub-sourced metadata (branch / pushedAt / stars / skillCount).
 from .github import (
     extract_description,
     get_repo_metas,
@@ -34,7 +29,7 @@ from .github import (
     get_tree_shas,
 )
 from .http import new_github_client
-from .io_utils import read_json, read_jsonl, write_json, write_jsonl
+from .io_utils import read_jsonl, write_jsonl
 
 # Concurrency for repo-level scanning. GitHub requests are I/O-bound, so a
 # thread pool overlaps network waits across repos. Capped at 8 to stay friendly
@@ -81,8 +76,7 @@ def _scan_one_repo(
     """
     effective_max = MAX_SKILL_COUNT if max_skill_count is None else max_skill_count
     source = dir_to_source(dir_name)
-    repo_dir = base_dir / dir_name
-    meta_path = repo_dir / META_FILE
+    cache = RepoCache.load(base_dir / dir_name, source)
 
     def bump(key: str, n: int = 1) -> None:
         with counters_lock:
@@ -94,75 +88,87 @@ def _scan_one_repo(
             # (and its skills) no longer appear in the index.
             bump("gone")
             print(f"  [gone] {source}: repo not found (404); removing stale data")
-            if repo_dir.exists():
-                shutil.rmtree(repo_dir)
+            cache.remove()
         else:
             bump("failed")
         return None
     pushed, branch, stars = metas[source]
 
-    prev = read_json(meta_path, default={}) or {}
+    if not force:
+        # Tombstoned mirror (loser of a previous run's fingerprint dedup):
+        # while neither repo has pushed again, the two skill trees are still
+        # identical, so skip entirely — no tarball download. A push on either
+        # side, or the winner disappearing, invalidates the tombstone and
+        # falls through to a full rescan; the dedup pass then re-adjudicates
+        # (re-tombstone or keep).
+        if cache.status == "tombstoned":
+            winner = str(cache.meta.get("dedupedInto") or "")
+            winner_meta = metas.get(winner)
+            if (
+                winner_meta is not None
+                and winner_meta[0] == cache.meta.get("winnerPushedAt")
+                and pushed == cache.pushed_at
+            ):
+                bump("skipped")
+                print(f"  [dedup-skip] {source}: still a mirror of {winner}")
+                return None
 
-    # Tombstoned mirror (loser of a previous run's fingerprint dedup): while
-    # neither repo has pushed again, the two skill trees are still identical,
-    # so skip entirely — no tarball download. A push on either side, or the
-    # winner disappearing, invalidates the tombstone and falls through to a
-    # full rescan; the dedup pass then re-adjudicates (re-tombstone or keep).
-    dedup_into = str(prev.get("dedupedInto") or "")
-    if dedup_into and not force:
-        winner_meta = metas.get(dedup_into)
+        # Repos excluded by the skillCount cap stay excluded without any
+        # tarball download while their pushedAt is unchanged and the cached
+        # count is still above the (current) cap. A push may bring the repo
+        # back under the cap, so it triggers a full re-adjudication below.
         if (
-            winner_meta is not None
-            and winner_meta[0] == prev.get("winnerPushedAt")
-            and pushed == prev.get("pushedAt")
+            cache.status == "filtered"
+            and effective_max > 0
+            and cache.skill_count > effective_max
+            and cache.pushed_at == pushed
         ):
-            bump("skipped")
-            print(f"  [dedup-skip] {source}: still a mirror of {dedup_into}")
-            return None
-
-    schema_upgrade = prev.get("schemaVersion") != SCHEMA_VERSION
-    up_to_date = (
-        not force
-        and meta_path.exists()
-        and prev.get("pushedAt") == pushed
-        and not schema_upgrade
-    )
-    if up_to_date:
-        # 已扫描过的仓库：仍受 skillCount 上限约束，避免聚合型仓库绕过上限。
-        cached_skill_count = prev.get("skillCount") or 0
-        if effective_max > 0 and cached_skill_count > effective_max:
             bump("filtered")
             bump("filtered_high_skill")
-            print(f"  [high-skill] {source}: {cached_skill_count} > {effective_max}")
-            if repo_dir.exists():
-                shutil.rmtree(repo_dir)
+            print(
+                f"  [high-skill] {source}: {cache.skill_count} > {effective_max} (cached)"
+            )
             return None
-        bump("skipped")
-        print(f"  [skip] {source}: pushed_at unchanged ({pushed})")
-        # 已扫描过的仓库仍纳入汇总，从既有产物读取
-        return _summarize_repo(repo_dir, meta_path, source)
 
-    # Trees 预检（仅热缓存仓库）：pushedAt 变了不必然意味着 SKILL.md 变了。
-    # 用一次 Trees API 调用（sha 与本地指纹同源）比对该仓库当前全部
-    # SKILL.md 的 blob sha；与缓存全等（如 README-only push）则跳过 tarball
-    # 下载，只刷新 meta 的时间戳。无缓存（首次扫描）或 tree 截断时直接
-    # 走 tarball 全量路径（get_tree_shas 返回 None）。
-    prev_shas = dict(prev.get("blobShas") or {})
-    if not force and not schema_upgrade and prev_shas:
-        try:
-            tree_shas = get_tree_shas(source, branch, client=client)
-        except Exception as exc:
-            print(f"  [tree] {source}: tree pre-check failed - {exc}; fetching tarball")
-            tree_shas = None
-        if tree_shas is not None and tree_shas == prev_shas:
-            bump("tree_skipped")
-            print(f"  [tree-skip] {source}: skills unchanged since {pushed}")
-            # 刷新 pushedAt（防止每轮重查 tree），其余缓存字段保持不变。
-            prev["pushedAt"] = pushed
-            prev["stars"] = stars
-            prev["lastScanned"] = now
-            write_json(meta_path, prev)
-            return _summarize_repo(repo_dir, meta_path, source)
+        if cache.status == "ok" and not cache.schema_stale and cache.has_data:
+            if cache.pushed_at == pushed:
+                # Cached repos stay subject to the skillCount cap so
+                # aggregator repos cannot sneak back in via a lowered cap.
+                if effective_max > 0 and cache.skill_count > effective_max:
+                    bump("filtered")
+                    bump("filtered_high_skill")
+                    print(f"  [high-skill] {source}: {cache.skill_count} > {effective_max}")
+                    cache.write_filtered(
+                        pushed=pushed, now=now, skill_count=cache.skill_count
+                    )
+                    return None
+                bump("skipped")
+                print(f"  [skip] {source}: pushed_at unchanged ({pushed})")
+                # Cached repos still join the summary; refresh stars /
+                # lastScanned so the summary and the next run's comparison
+                # always work from fresh values.
+                cache.refresh(pushed=pushed, stars=stars, now=now)
+                return cache.summarize()
+
+            # Trees pre-check (warm cache only): a changed pushedAt does not
+            # necessarily mean the SKILL.md files changed. One Trees API call
+            # (shas from the same source as the local fingerprint) compares
+            # the repo's current public SKILL.md blob shas against the cache;
+            # on a full match (e.g. a README-only push) the tarball download
+            # is skipped and only the meta timestamps are refreshed. A cold
+            # cache (first scan) or a truncated tree goes straight to the
+            # tarball path (get_tree_shas returns None).
+            if cache.skill_shas:
+                try:
+                    tree_shas = get_tree_shas(source, branch, client=client)
+                except Exception as exc:
+                    print(f"  [tree] {source}: tree pre-check failed - {exc}; fetching tarball")
+                    tree_shas = None
+                if tree_shas is not None and tree_shas == cache.skill_shas:
+                    bump("tree_skipped")
+                    print(f"  [tree-skip] {source}: skills unchanged since {pushed}")
+                    cache.refresh(pushed=pushed, stars=stars, now=now)
+                    return cache.summarize()
 
     try:
         blobs, contents, filtered_nonpublic = get_skill_contents(
@@ -176,37 +182,33 @@ def _scan_one_repo(
         bump("skills_filtered_nonpublic", filtered_nonpublic)
 
     skills = build_skill_records(blobs, contents)
-    write_jsonl(repo_dir / SCANNED_FILE, skills)
 
-    meta = {
-        "source": source,
-        "branch": branch,
-        "pushedAt": pushed,
-        "stars": stars,
-        "lastScanned": now,
-        "skillCount": len(skills),
-        "schemaVersion": SCHEMA_VERSION,
-        "blobShas": {path: sha for _name, (path, sha) in blobs.items()},
-    }
-    write_json(meta_path, meta)
-
-    # Drop repos whose skill count exceeds the cap (e.g. aggregator/awesome-list
-    # repos) so they never enter the index; remove their stale scan data.
+    # Repos whose skill count exceeds the cap (e.g. aggregator/awesome-list
+    # repos) never enter the index: tombstone the cache (keeping the count
+    # fingerprint) instead of deleting it, so later runs skip the tarball
+    # entirely until the repo pushes again.
     if effective_max > 0 and len(skills) > effective_max:
         bump("filtered")
         bump("filtered_high_skill")
-        print(f"  [high-skill] {source}: {len(skills)} > {effective_max}; removing cache")
-        if repo_dir.exists():
-            shutil.rmtree(repo_dir)
+        print(f"  [high-skill] {source}: {len(skills)} > {effective_max}; tombstoned")
+        cache.write_filtered(pushed=pushed, now=now, skill_count=len(skills))
         return None
 
+    cache.write_ok(
+        branch=branch,
+        pushed=pushed,
+        stars=stars,
+        now=now,
+        skills=skills,
+        skill_shas={path: sha for _name, (path, sha) in blobs.items()},
+    )
     bump("updated")
     bump("new_skills", len(skills))
     filtered_note = (
         f", {filtered_nonpublic} non-public filtered" if filtered_nonpublic else ""
     )
     print(f"  [scan] {source}: {len(skills)} skills{filtered_note}")
-    return _summarize_repo(repo_dir, meta_path, source)
+    return cache.summarize()
 
 
 def scan_repositories(
@@ -345,19 +347,6 @@ def scan_repositories(
     return summary
 
 
-def _summarize_repo(repo_dir: Path, meta_path: Path, source: str) -> JSON:
-    """Read a repo's persisted meta + skills into a single summary record."""
-    meta = read_json(meta_path, default={}) or {}
-    skills = read_jsonl(repo_dir / SCANNED_FILE)
-    return {
-        "source": source,
-        "pushedAt": meta.get("pushedAt"),
-        "stars": meta.get("stars"),
-        "skillCount": meta.get("skillCount", len(skills)),
-        "skills": [s["path"] for s in skills],
-    }
-
-
 def _content_fingerprint(shas: dict[str, str]) -> str:
     """Stable serialization of a repo's skill tree ({path: blob sha})."""
     return json.dumps(sorted(shas.items()), ensure_ascii=False)
@@ -371,18 +360,19 @@ def _dedup_repos(
     Two repos with the same {path: blob sha} map carry exactly the same
     SKILL.md files — an undiverged fork or copy. Within each identical group
     only the most-starred repo survives (fetch order breaks ties); the rest
-    are removed from the summary and tombstoned: their `scanned.jsonl` is
-    deleted and `meta.json` is replaced by a `dedupedInto` marker, so their
-    duplicate skills never reach index.jsonl and later runs skip them without
-    any network I/O (until either repo pushes again, which invalidates the
-    tombstone and triggers a rescan). Repos with no skills have no fingerprint
-    and are never deduped. Returns ``(kept, [(loser, winner)])``.
+    are removed from the summary and tombstoned via
+    :meth:`RepoCache.write_tombstone` (scanned.jsonl deleted, meta.json
+    replaced by a ``tombstoned`` marker), so their duplicate skills never
+    reach index.jsonl and later runs skip them without any network I/O (until
+    either repo pushes again, which invalidates the tombstone and triggers a
+    rescan). Repos with no skills have no fingerprint and are never deduped.
+    Returns ``(kept, [(loser, winner)])``.
     """
     pushed_at = {str(r.get("source", "")): r.get("pushedAt") for r in repos}
     groups: dict[str, list[JSON]] = {}
     for r in repos:
-        meta_path = base_dir / source_to_dir(str(r.get("source", ""))) / META_FILE
-        shas = (read_json(meta_path, default={}) or {}).get("blobShas") or {}
+        source = str(r.get("source", ""))
+        shas = RepoCache.load(base_dir / source_to_dir(source), source).skill_shas
         if not shas:
             continue
         groups.setdefault(_content_fingerprint(shas), []).append(r)
@@ -402,20 +392,13 @@ def _dedup_repos(
 
     for loser, winner in sorted(losers.items()):
         print(f"  [dedup] {loser}: identical skill tree to {winner}; tombstoned")
-        repo_dir = base_dir / source_to_dir(loser)
-        if repo_dir.exists():
-            # 墓碑 meta 不带 blobShas：无效化后的重扫不会拿过期指纹走
-            # tree 预检，必定重新下载 tarball 全量裁决。
-            (repo_dir / SCANNED_FILE).unlink(missing_ok=True)
-            write_json(
-                repo_dir / META_FILE,
-                {
-                    "source": loser,
-                    "dedupedInto": winner,
-                    "winnerPushedAt": pushed_at.get(winner),
-                    "pushedAt": pushed_at.get(loser),
-                    "lastScanned": now,
-                },
+        loser_dir = base_dir / source_to_dir(loser)
+        if loser_dir.exists():
+            RepoCache.load(loser_dir, loser).write_tombstone(
+                winner=winner,
+                winner_pushed=str(pushed_at.get(winner) or ""),
+                pushed=str(pushed_at.get(loser) or ""),
+                now=now,
             )
     kept = [r for r in repos if str(r.get("source", "")) not in losers]
     return kept, sorted(losers.items())

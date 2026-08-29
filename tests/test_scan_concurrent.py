@@ -32,8 +32,9 @@ def _make_by_source(base_dir: Path) -> None:
         # (pushedAt mismatch) so they get rescanned; 1-3 stay up-to-date.
         prev_pushed = pushed if i <= 3 else "1999-01-01T00:00:00Z"
         (repo_dir / config.META_FILE).write_text(
-            f'{{"pushedAt": "{prev_pushed}", "schemaVersion": {config.SCHEMA_VERSION}, '
-            f'"stars": {i * 100}, "skillCount": 1, "blobShas": {{}}}}'
+            f'{{"schemaVersion": {config.SCHEMA_VERSION}, "status": "ok", '
+            f'"pushedAt": "{prev_pushed}", "stars": {i * 100}, '
+            f'"skillCount": 1, "skillShas": {{}}}}'
         )
         (repo_dir / config.SCANNED_FILE).write_text(
             '{"path": "skills/a", "description": "cached"}\n'
@@ -210,10 +211,11 @@ def test_scan_dedups_identical_skill_trees(monkeypatch, tmp_path):
     # 镜像被墓碑化：目录保留，scanned.jsonl 删除，meta.json 记录裁决依据。
     mirror_dir = base_dir / config.source_to_dir("small/mirror")
     meta = read_json(mirror_dir / config.META_FILE)
+    assert meta["status"] == "tombstoned"
     assert meta["dedupedInto"] == "big/repo"
     assert meta["winnerPushedAt"] == "2024-01-01T00:00:00Z"
     assert meta["pushedAt"] == "2024-01-01T00:00:00Z"
-    assert "blobShas" not in meta  # 无过期指纹，无效化后的重扫必走 tarball
+    assert "skillShas" not in meta  # 无过期指纹，无效化后的重扫必走 tarball
     assert not (mirror_dir / config.SCANNED_FILE).exists()
     # 仅统计幸存仓库的技能（big/repo 2 个 + other/repo 1 个）。
     assert summary["skills_scanned"] == 3
@@ -358,10 +360,11 @@ def test_scan_tree_precheck_skips_tarball_on_skill_unchanged(monkeypatch, tmp_pa
     base_dir = tmp_path / "by-source"
     repo_dir = base_dir / config.source_to_dir("owner/repo")
     repo_dir.mkdir(parents=True)
-    # 上次扫描：pushedAt 较旧，blobShas 是本次 tree 预检的比对基准。
+    # 上次扫描：pushedAt 较旧，skillShas 是本次 tree 预检的比对基准。
     (repo_dir / config.META_FILE).write_text(
-        f'{{"pushedAt": "2024-01-01T00:00:00Z", "schemaVersion": {config.SCHEMA_VERSION}, '
-        f'"stars": 50, "skillCount": 1, "blobShas": {{"skills/a": "sha-a"}}}}'
+        f'{{"schemaVersion": {config.SCHEMA_VERSION}, "status": "ok", '
+        f'"pushedAt": "2024-01-01T00:00:00Z", "stars": 50, "skillCount": 1, '
+        f'"skillShas": {{"skills/a": "sha-a"}}}}'
     )
     (repo_dir / config.SCANNED_FILE).write_text(
         '{"path": "skills/a", "description": "cached"}\n'
@@ -407,8 +410,9 @@ def test_scan_tree_precheck_mismatch_downloads_tarball(monkeypatch, tmp_path):
     repo_dir = base_dir / config.source_to_dir("owner/repo")
     repo_dir.mkdir(parents=True)
     (repo_dir / config.META_FILE).write_text(
-        f'{{"pushedAt": "2024-01-01T00:00:00Z", "schemaVersion": {config.SCHEMA_VERSION}, '
-        f'"stars": 50, "skillCount": 1, "blobShas": {{"skills/a": "sha-old"}}}}'
+        f'{{"schemaVersion": {config.SCHEMA_VERSION}, "status": "ok", '
+        f'"pushedAt": "2024-01-01T00:00:00Z", "stars": 50, "skillCount": 1, '
+        f'"skillShas": {{"skills/a": "sha-old"}}}}'
     )
     (repo_dir / config.SCANNED_FILE).write_text(
         '{"path": "skills/a", "description": "old"}\n'
@@ -452,8 +456,12 @@ def test_scan_tree_precheck_error_falls_back_to_tarball(monkeypatch, tmp_path):
     repo_dir = base_dir / config.source_to_dir("owner/repo")
     repo_dir.mkdir(parents=True)
     (repo_dir / config.META_FILE).write_text(
-        f'{{"pushedAt": "2024-01-01T00:00:00Z", "schemaVersion": {config.SCHEMA_VERSION}, '
-        f'"stars": 50, "skillCount": 1, "blobShas": {{"skills/a": "sha-a"}}}}'
+        f'{{"schemaVersion": {config.SCHEMA_VERSION}, "status": "ok", '
+        f'"pushedAt": "2024-01-01T00:00:00Z", "stars": 50, "skillCount": 1, '
+        f'"skillShas": {{"skills/a": "sha-a"}}}}'
+    )
+    (repo_dir / config.SCANNED_FILE).write_text(
+        '{"path": "skills/a", "description": "cached"}\n'
     )
 
     monkeypatch.setattr(scan_mod, "SCANNED_REPOS", tmp_path / "scanned-repos.jsonl")
@@ -521,6 +529,32 @@ def test_scan_tree_precheck_cold_cache_skips_precheck(monkeypatch, tmp_path):
     assert summary["repos_updated"] == 1
 
 
+def test_scan_max_skill_count_zero_disables_cap(monkeypatch, tmp_path):
+    """--max-skill-count 0 显式关闭上限：超过 500 个技能的仓库不再被过滤。"""
+    OWNERS = {"big/aggregator": ("2024-01-01T00:00:00Z", "main", 10)}
+    base_dir = tmp_path / "by-source"
+    (base_dir / config.source_to_dir("big/aggregator")).mkdir(parents=True)
+    monkeypatch.setattr(scan_mod, "SCANNED_REPOS", tmp_path / "scanned-repos.jsonl")
+    monkeypatch.setattr(
+        scan_mod,
+        "get_repo_metas",
+        lambda sources, *, client=None, max_workers=8: (dict(OWNERS), set()),
+    )
+    blobs = {f"s{i}": (f"skills/s{i}", f"sha-{i}") for i in range(501)}
+    contents = {f"skills/s{i}": f"---\ndescription: s{i}\n---\n" for i in range(501)}
+    monkeypatch.setattr(
+        scan_mod,
+        "get_skill_contents",
+        lambda source, branch, *, client=None: (blobs, contents, 0),
+    )
+
+    summary = scan_repositories(max_skill_count=0, base_dir=base_dir)
+
+    assert summary["repos_filtered"] == 0
+    assert summary["repos_updated"] == 1
+    assert summary["skills_scanned"] == 501
+
+
 def test_is_missing_repo_checks_http_status():
     from skills_index.github import _is_missing_repo
     from skills_index.http import HttpError
@@ -535,12 +569,14 @@ def test_is_missing_repo_checks_http_status():
 
 def test_scan_filters_high_skillcount_repos(monkeypatch, tmp_path):
     """Repos with skillCount > --max-skill-count are dropped (both the cached
-    up-to-date branch and the freshly scanned branch) and their cache removed.
+    up-to-date branch and the freshly scanned branch) and tombstoned: their
+    meta keeps `status: filtered` + the count fingerprint, while scanned.jsonl
+    is removed so no skill leaks into the index.
 
-    owner1 is up-to-date with a cached skillCount=600 (>500) -> filtered via the
-    up-to-date branch. owner4 is stale and, when rescanned, yields 501 skill
-    blobs (>500) -> filtered via the scan branch. owner2/3 (up-to-date) and
-    owner5/6 (stale, 1 skill) are kept.
+    owner1 is up-to-date with a cached skillCount=600 (>500) -> filtered via
+    the up-to-date branch. owner4 is stale and, when rescanned, yields 501
+    skill blobs (>500) -> filtered via the scan branch. owner2/3 (up-to-date)
+    and owner5/6 (stale, 1 skill) are kept.
     """
     OWNERS = {
         f"owner{i}/repo{i}": (f"2024-01-0{i}T00:00:0{i}Z", "main", i * 100)
@@ -554,8 +590,9 @@ def test_scan_filters_high_skillcount_repos(monkeypatch, tmp_path):
         prev_pushed = pushed if i <= 3 else "1999-01-01T00:00:00Z"
         cached_skill = 600 if i == 1 else 1  # owner1 cached above the cap
         (repo_dir / config.META_FILE).write_text(
-            f'{{"pushedAt": "{prev_pushed}", "schemaVersion": {config.SCHEMA_VERSION}, '
-            f'"stars": {i * 100}, "skillCount": {cached_skill}, "blobShas": {{}}}}'
+            f'{{"schemaVersion": {config.SCHEMA_VERSION}, "status": "ok", '
+            f'"pushedAt": "{prev_pushed}", "stars": {i * 100}, '
+            f'"skillCount": {cached_skill}, "skillShas": {{}}}}'
         )
         (repo_dir / config.SCANNED_FILE).write_text(
             '{"path": "skills/a", "description": "cached"}\n'
@@ -576,7 +613,7 @@ def test_scan_filters_high_skillcount_repos(monkeypatch, tmp_path):
             }
             return blobs, contents, 0
         # Per-source sha keeps each repo's skill-tree fingerprint distinct
-        # (identical blobShas would trip the mirror dedup).
+        # (identical skillShas would trip the mirror dedup).
         return (
             {"a": ("skills/a", f"sha-{source}")},
             {"skills/a": "---\ndescription: desc\n---\n"},
@@ -595,13 +632,105 @@ def test_scan_filters_high_skillcount_repos(monkeypatch, tmp_path):
     # high-skill repos (owner1, owner4) are filtered out and excluded.
     assert summary["skills_scanned"] == 4
     assert summary["skills_scanned_new"] == 2
-    # High-skill repos' cache dirs are removed entirely.
-    assert not (base_dir / config.source_to_dir("owner1/repo1")).exists()
-    assert not (base_dir / config.source_to_dir("owner4/repo4")).exists()
+    # High-skill repos are tombstoned, not deleted: the dir keeps a
+    # `filtered` meta carrying pushedAt + the count fingerprint, while the
+    # scan data is gone.
+    for source, count in (("owner1/repo1", 600), ("owner4/repo4", 501)):
+        repo_dir = base_dir / config.source_to_dir(source)
+        assert repo_dir.exists()
+        assert not (repo_dir / config.SCANNED_FILE).exists()
+        meta = read_json(repo_dir / config.META_FILE)
+        assert meta["status"] == "filtered"
+        assert meta["skillCount"] == count
+        assert meta["pushedAt"] == OWNERS[source][0]
+        assert "skillShas" not in meta
     # Kept repos retain their cache.
-    assert (base_dir / config.source_to_dir("owner2/repo2")).exists()
-    assert (base_dir / config.source_to_dir("owner5/repo5")).exists()
+    assert (base_dir / config.source_to_dir("owner2/repo2") / config.SCANNED_FILE).exists()
+    assert (base_dir / config.source_to_dir("owner5/repo5") / config.SCANNED_FILE).exists()
     # Filtered repos are absent from the per-repo summary.
     repos = read_jsonl(scanned_repos)
     kept = {r["source"] for r in repos}
     assert kept == {"owner2/repo2", "owner3/repo3", "owner5/repo5", "owner6/repo6"}
+
+
+def test_scan_filtered_repo_skipped_until_push(monkeypatch, tmp_path):
+    """F4 墓碑生命周期：超上限仓库被过滤后，后续轮次免 tarball 直接跳过；
+    仓库有新推送（可能回到上限以内）时重新全量裁决，仍超限则更新墓碑。"""
+    OWNERS = {"big/aggregator": ("2024-01-01T00:00:00Z", "main", 10)}
+    base_dir = tmp_path / "by-source"
+    repo_dir = base_dir / config.source_to_dir("big/aggregator")
+    repo_dir.mkdir(parents=True)
+    monkeypatch.setattr(scan_mod, "SCANNED_REPOS", tmp_path / "scanned-repos.jsonl")
+
+    downloads = {"n": 0}
+
+    def fake_metas(sources, *, client=None, max_workers=8):
+        return {s: OWNERS[s] for s in sources}, set()
+
+    def fake_contents(source, branch, *, client=None):
+        downloads["n"] += 1
+        blobs = {f"s{i}": (f"skills/s{i}", f"sha-{i}") for i in range(501)}
+        contents = {f"skills/s{i}": f"---\ndescription: s{i}\n---\n" for i in range(501)}
+        return blobs, contents, 0
+
+    monkeypatch.setattr(scan_mod, "get_repo_metas", fake_metas)
+    monkeypatch.setattr(scan_mod, "get_skill_contents", fake_contents)
+
+    # 第 1 轮：501 个技能 > 500 -> 过滤并墓碑化。
+    summary = scan_repositories(base_dir=base_dir)
+    assert summary["repos_filtered"] == 1
+    assert summary["repos_updated"] == 0
+    assert downloads["n"] == 1
+    meta = read_json(repo_dir / config.META_FILE)
+    assert meta["status"] == "filtered"
+    assert meta["skillCount"] == 501
+    assert not (repo_dir / config.SCANNED_FILE).exists()
+
+    # 第 2 轮：无新推送 -> 免 tarball 跳过（增量模式下过滤结果被缓存）。
+    downloads["n"] = 0
+    summary = scan_repositories(base_dir=base_dir)
+    assert summary["repos_filtered"] == 1
+    assert summary["repos_updated"] == 0
+    assert downloads["n"] == 0
+    assert read_jsonl(scan_mod.SCANNED_REPOS) == []
+
+    # 第 3 轮：仓库有推送 -> 墓碑失效、重新裁决；仍超限 -> 更新墓碑快照。
+    OWNERS["big/aggregator"] = ("2024-02-01T00:00:00Z", "main", 10)
+    summary = scan_repositories(base_dir=base_dir)
+    assert downloads["n"] == 1
+    assert summary["repos_filtered"] == 1
+    meta = read_json(repo_dir / config.META_FILE)
+    assert meta["status"] == "filtered"
+    assert meta["pushedAt"] == "2024-02-01T00:00:00Z"
+
+
+def test_scan_purges_legacy_files_on_skip(monkeypatch, tmp_path):
+    """缓存目录内契约之外的遗留文件（如旧版 per-dir fetched.jsonl 副本）在
+    任意一次 meta 重写（含 pushed_at 未变的 skip 刷新）时被清理。"""
+    OWNERS = {"owner/repo": ("2024-01-01T00:00:00Z", "main", 50)}
+    base_dir = tmp_path / "by-source"
+    repo_dir = base_dir / config.source_to_dir("owner/repo")
+    repo_dir.mkdir(parents=True)
+    (repo_dir / config.META_FILE).write_text(
+        f'{{"schemaVersion": {config.SCHEMA_VERSION}, "status": "ok", '
+        f'"pushedAt": "2024-01-01T00:00:00Z", "stars": 50, "skillCount": 1, '
+        f'"skillShas": {{}}}}'
+    )
+    (repo_dir / config.SCANNED_FILE).write_text(
+        '{"path": "skills/a", "description": "cached"}\n'
+    )
+    legacy = repo_dir / "fetched.jsonl"  # 旧版格式遗留的 per-dir 副本
+    legacy.write_text('{"skillId": "a"}\n')
+
+    monkeypatch.setattr(scan_mod, "SCANNED_REPOS", tmp_path / "scanned-repos.jsonl")
+    monkeypatch.setattr(
+        scan_mod,
+        "get_repo_metas",
+        lambda sources, *, client=None, max_workers=8: (dict(OWNERS), set()),
+    )
+
+    summary = scan_repositories(base_dir=base_dir)
+
+    assert summary["repos_skipped"] == 1
+    assert not legacy.exists()  # skip 时的 meta 刷新顺手清掉了遗留文件
+    assert (repo_dir / config.SCANNED_FILE).exists()
