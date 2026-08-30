@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 from pathlib import Path
 
+from .cache import RepoCache
 from .config import (
     BY_SOURCE_DIR,
     FETCHED_SKILLS,
@@ -23,6 +24,7 @@ from .io_utils import read_jsonl, write_json, write_jsonl
 _INDEX_FIELD_ORDER = (
     "skillId",
     "source",
+    "stars",
     "description",
     "installs",
     "weeklyInstalls",
@@ -91,6 +93,9 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
 
     - each repo's `scanned.jsonl` is the baseline: every scanned skill is
       written to index.jsonl.
+    - the repo's cache meta.json provides the repo-level `stars` count
+      (fetched by the scan step from the GitHub repo metadata), attached to
+      every skill of that repo.
     - `fetched-skills.jsonl` provides the skills.sh metadata (installs /
       weeklyInstalls), joined on `source` + `skillId`. Scanned skills with no
       fetched counterpart ("scan-only", e.g. not registered on skills.sh) keep
@@ -133,6 +138,12 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
     for dir_name in subdirs:
         source = dir_to_source(dir_name)
         gh_path = base_dir / dir_name / SCANNED_FILE
+        # Repo-level stars come from the same scan run that wrote
+        # scanned.jsonl (cache contract: scanned.jsonl only exists for
+        # "ok"-status metas, which always carry `stars`); 0 covers a missing
+        # or pre-stars legacy meta, e.g. when index runs against a stale cache.
+        cache = RepoCache.load(base_dir / dir_name, source)
+        stars = int(cache.meta.get("stars") or 0)
         for rec in read_jsonl(gh_path):
             skill_id = Path(str(rec.get("path", ""))).name
             key = (source, skill_id)
@@ -140,9 +151,9 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
             if base is None:
                 # GitHub repo contains a SKILL.md not registered on skills.sh:
                 # still indexed, with empty skills.sh metadata.
-                scan_only.append({"source": source, "skillId": skill_id, **rec})
+                scan_only.append({"source": source, "skillId": skill_id, "stars": stars, **rec})
                 continue
-            matched.append((rank[key], {**base, **rec}))
+            matched.append((rank[key], {**base, **rec, "stars": stars}))
             matched_keys.add(key)
 
     # Skills with fetched data keep the skills.sh ranking order; scan-only
@@ -171,6 +182,9 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
                 "scanOnly": len(result) - with_installs,
             },
             "weeklyInstalls": {"order": "oldest-first", "maxWeeks": 8},
+            # stars are repo-level: every skill of a repo carries the same
+            # count, as observed by the scan step at generatedAt time.
+            "stars": {"scope": "per-repo", "sharedBySkillsOfRepo": True},
         },
     )
     summary["scanned_merged"] = len(matched)

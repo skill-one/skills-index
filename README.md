@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-An index of [skills.sh](https://skills.sh) skills: see every skill's `source` / `skillId` / `installs` / `weeklyInstalls` (from skills.sh) in one place, together with the repository-relative `path` and the skill `description` obtained by scanning GitHub repositories.
+An index of [skills.sh](https://skills.sh) skills: see every skill's `source` / `skillId` / `installs` / `weeklyInstalls` (from skills.sh) in one place, together with the repository's `stars`, the repository-relative `path`, and the skill `description` obtained by scanning GitHub repositories.
 
 **Consumers never need to clone anything** — just pull a published index snapshot. How the data is produced is documented in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) (developer-facing).
 
@@ -16,6 +16,7 @@ The final index `index.jsonl` is **flattened per skill**, one skill per line:
 {
   "source": "vercel-labs/skills",
   "skillId": "find-skills",
+  "stars": 29929,
   "installs": 3005209,
   "weeklyInstalls": [
     113781, 109199, 109085, 115475, 107969, 101120, 96861, 93130
@@ -29,6 +30,7 @@ The final index `index.jsonl` is **flattened per skill**, one skill per line:
 | ----------------- | ---------------------------------------------------------------------- |
 | `source`          | GitHub repository in `owner/repo` form                                 |
 | `skillId`         | Skill identifier (the skill's directory name)                          |
+| `stars`           | Star count of the skill's repository (repo-level: every skill from the same repo carries the same value) |
 | `installs`        | Total installs (from skills.sh)                                        |
 | `weeklyInstalls`  | Weekly installs over the last 8 weeks (from skills.sh, chronological)  |
 | `path`            | Skill's path relative to the repository root (e.g. `skills/find-skills`) |
@@ -37,7 +39,7 @@ The final index `index.jsonl` is **flattened per skill**, one skill per line:
 > The index **does not store a ready-to-use `url`**; compose the full GitHub directory URL from `source` + `path`:
 > `https://github.com/<source>/tree/HEAD/<path>` (`HEAD` always resolves to the default branch, so it is unaffected by branch changes).
 >
-> Skills not tracked by skills.sh are still included in the index; they simply lack the `installs` / `weeklyInstalls` fields.
+> Skills not tracked by skills.sh are still included in the index; they simply lack the `installs` / `weeklyInstalls` fields. Every record carries `stars`.
 
 ## Published artifacts
 

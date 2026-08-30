@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-[skills.sh](https://skills.sh) 技能的索引：在一处查看每个技能的 `source` / `skillId` / `installs` / `weeklyInstalls`（来自 skills.sh），以及经仓库扫描得到的 GitHub 仓库内相对路径 `path` 与技能说明 `description`。
+[skills.sh](https://skills.sh) 技能的索引：在一处查看每个技能的 `source` / `skillId` / `installs` / `weeklyInstalls`（来自 skills.sh），以及所在仓库的 `stars`、经仓库扫描得到的 GitHub 仓库内相对路径 `path` 与技能说明 `description`。
 
 **消费方无需 clone 仓库**，直接拉取发布好的索引快照即可。数据的产生方式见 [docs/DEVELOPMENT.zh-CN.md](docs/DEVELOPMENT.zh-CN.md)（面向开发者）。
 
@@ -16,6 +16,7 @@
 {
   "source": "vercel-labs/skills",
   "skillId": "find-skills",
+  "stars": 29929,
   "installs": 3005209,
   "weeklyInstalls": [
     113781, 109199, 109085, 115475, 107969, 101120, 96861, 93130
@@ -29,6 +30,7 @@
 | ----------------- | -------------------------------------------------------------------- |
 | `source`          | GitHub 仓库，形如 `owner/repo`                                       |
 | `skillId`         | 技能标识（技能目录名）                                               |
+| `stars`           | 技能所在仓库的 star 数（仓库级：同一仓库的所有技能共享同一值）         |
 | `installs`        | 总安装量（来自 skills.sh）                                           |
 | `weeklyInstalls`  | 近 8 周周安装量（来自 skills.sh，按时间顺序）                        |
 | `path`            | 技能在仓库内的相对路径（如 `skills/find-skills`）                    |
@@ -37,7 +39,7 @@
 > 索引**不存储可直接访问的 `url`**；完整 GitHub 目录 URL 由 `source` + `path` 拼接得到：
 > `https://github.com/<source>/tree/HEAD/<path>`（`HEAD` 恒指向默认分支，分支变更也不受影响）。
 >
-> skills.sh 未收录的技能同样会进入索引，只是 `installs` / `weeklyInstalls` 字段不出现。
+> skills.sh 未收录的技能同样会进入索引，只是 `installs` / `weeklyInstalls` 字段不出现。每条记录都携带 `stars`。
 
 ## 发布的产物
 

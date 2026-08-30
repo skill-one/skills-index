@@ -10,15 +10,21 @@ import pytest
 
 from skills_index import config
 from skills_index import index as index_mod
-from skills_index.io_utils import read_jsonl, write_jsonl
+from skills_index.io_utils import read_jsonl, write_json, write_jsonl
 
 
 def _setup_data(
-    tmp_path: Path, *, fetched: list[dict], scanned: dict[str, list[dict]]
+    tmp_path: Path,
+    *,
+    fetched: list[dict],
+    scanned: dict[str, list[dict]],
+    stars: dict[str, int] | None = None,
 ) -> tuple[Path, Path, Path]:
-    """Create data/fetched-skills.jsonl + data/by-source/<dir>/scanned.jsonl.
+    """Create data/fetched-skills.jsonl + data/by-source/<dir>/ cache files.
 
-    Returns ``(fetched_path, index_path, by_source_dir)``.
+    Each repo dir gets a scanned.jsonl plus an "ok"-status meta.json whose
+    `stars` comes from `stars[dir]` (0 by default), mirroring what the scan
+    step persists. Returns ``(fetched_path, index_path, by_source_dir)``.
     """
     data = tmp_path / "data"
     by_source = data / "by-source"
@@ -29,6 +35,15 @@ def _setup_data(
         gh = by_source / dir_name
         gh.mkdir()
         write_jsonl(gh / "scanned.jsonl", records)
+        write_json(
+            gh / "meta.json",
+            {
+                "schemaVersion": config.SCHEMA_VERSION,
+                "status": "ok",
+                "source": config.dir_to_source(dir_name),
+                "stars": (stars or {}).get(dir_name, 0),
+            },
+        )
     return fetched_path, data / "index.jsonl", by_source
 
 
@@ -53,7 +68,7 @@ def test_run_index_merges_scanned_into_fetched(
 
     # `b` only exists in skills.sh, not in the repo scan -> dropped.
     assert records == [
-        {"source": "owner/repo", "skillId": "a", "installs": 10,
+        {"source": "owner/repo", "skillId": "a", "stars": 0, "installs": 10,
          "weeklyInstalls": [], "path": "skills/a", "description": "A"}
     ]
     assert read_jsonl(index_path) == records
@@ -93,6 +108,7 @@ def test_run_index_writes_meta_sidecar(
         "scanOnly": len(records) - 1,
     }
     assert meta["weeklyInstalls"] == {"order": "oldest-first", "maxWeeks": 8}
+    assert meta["stars"] == {"scope": "per-repo", "sharedBySkillsOfRepo": True}
 
 
 def test_run_index_keeps_fetched_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -120,7 +136,8 @@ def test_run_index_keeps_fetched_order(tmp_path: Path, monkeypatch: pytest.Monke
 def test_run_index_includes_scan_only_skills(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """仓库有、榜单无的技能仍入索引，installs/weeklyInstalls 字段不出现，追加在末尾。"""
+    """仓库有、榜单无的技能仍入索引，installs/weeklyInstalls 字段不出现，追加在末尾；
+    stars 是仓库级数据，scan-only 技能同样携带。"""
     fetched = [{"source": "owner/repo", "skillId": "a", "installs": 1}]
     scanned = {
         "owner__repo": [
@@ -128,15 +145,17 @@ def test_run_index_includes_scan_only_skills(
             {"path": "skills/gh-only", "description": "not on skills.sh"},
         ]
     }
-    fetched_path, index_path, by_source = _setup_data(tmp_path, fetched=fetched, scanned=scanned)
+    fetched_path, index_path, by_source = _setup_data(
+        tmp_path, fetched=fetched, scanned=scanned, stars={"owner__repo": 321}
+    )
     _patch_paths(monkeypatch, fetched_path, index_path)
 
     records, summary = index_mod.run_index(base_dir=by_source)
 
     assert records == [
-        {"source": "owner/repo", "skillId": "a", "installs": 1,
+        {"source": "owner/repo", "skillId": "a", "stars": 321, "installs": 1,
          "weeklyInstalls": [], "path": "skills/a", "description": "A"},
-        {"source": "owner/repo", "skillId": "gh-only",
+        {"source": "owner/repo", "skillId": "gh-only", "stars": 321,
          "path": "skills/gh-only", "description": "not on skills.sh"},
     ]
     assert summary["scan_only"] == 1
@@ -155,7 +174,7 @@ def test_run_index_empty_fetched_still_indexes_scanned(
     records, summary = index_mod.run_index(base_dir=by_source)
 
     assert records == [
-        {"source": "owner/repo", "skillId": "a",
+        {"source": "owner/repo", "skillId": "a", "stars": 0,
          "path": "skills/a", "description": "A"}
     ]
     assert read_jsonl(index_path) == records
@@ -246,3 +265,41 @@ def test_run_index_no_dedup_on_empty_description(
 
     assert summary["deduped_skills"] == 0
     assert len(records) == 2
+
+
+def test_run_index_attaches_repo_stars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """每条记录的 stars 取自其所在仓库（cache meta.json），仓库内所有技能共享同一值。"""
+    fetched = [
+        {"source": "hot/r", "skillId": "x", "installs": 10},
+        {"source": "cold/r", "skillId": "y", "installs": 5},
+    ]
+    scanned = {
+        "hot__r": [{"path": "skills/x", "description": "X"}],
+        "cold__r": [{"path": "skills/y", "description": "Y"}],
+    }
+    fetched_path, index_path, by_source = _setup_data(
+        tmp_path, fetched=fetched, scanned=scanned, stars={"hot__r": 5000, "cold__r": 7}
+    )
+    _patch_paths(monkeypatch, fetched_path, index_path)
+
+    records, _ = index_mod.run_index(base_dir=by_source)
+
+    stars_by_skill = {r["skillId"]: r["stars"] for r in records}
+    assert stars_by_skill == {"x": 5000, "y": 7}
+
+
+def test_run_index_stars_zero_without_meta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """meta.json 缺失（如旧版缓存）时不报错，stars 兜底为 0。"""
+    fetched = [{"source": "owner/repo", "skillId": "a", "installs": 1}]
+    scanned = {"owner__repo": [{"path": "skills/a", "description": "A"}]}
+    fetched_path, index_path, by_source = _setup_data(tmp_path, fetched=fetched, scanned=scanned)
+    _patch_paths(monkeypatch, fetched_path, index_path)
+    (by_source / "owner__repo" / "meta.json").unlink()
+
+    records, _ = index_mod.run_index(base_dir=by_source)
+
+    assert records[0]["stars"] == 0
