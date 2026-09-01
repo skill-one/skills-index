@@ -206,8 +206,9 @@ jobs:
       # makes index.jsonl addressable as a normal git file so CORS-enabled CDN
       # proxies (cdn.jsdelivr.net / cdn.jsdmirror.com /gh/...@dist/...) can
       # serve it — release assets are not proxyable. index-meta.json rides
-      # along so CDN consumers can read generatedAt / formatVersion. Main
-      # only, so smoke runs on `test` never overwrite the published index.
+      # along so CDN consumers can read generatedAt / formatVersion /
+      # distCommit. Main only, so smoke runs on `test` never overwrite the
+      # published index.
       - name: Publish index.jsonl to dist branch (CDN-accessible)
         if: github.ref_name == 'main'
         env:
@@ -225,6 +226,21 @@ jobs:
           git add index.jsonl index-meta.json
           git commit -m "index snapshot ${{ steps.scope.outputs.ts }}"
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin dist
+          # Backfill distCommit: the dist commit carrying this snapshot's
+          # index.jsonl only exists after the push, and consumers use it to
+          # fetch the jsonl from an immutable, commit-addressed URL
+          # (.../gh/<repo>@<sha>/index.jsonl) instead of the mutable `dist`
+          # ref. index.jsonl bytes are identical in both commits, so the
+          # recorded snapshot stays immutable. The backfilled meta is pushed
+          # as a second commit and also lands in the Release assets /
+          # data.tar.gz via the workspace copy.
+          dist_commit=$(git rev-parse HEAD)
+          jq --arg c "$dist_commit" '.distCommit = $c' index-meta.json > "$RUNNER_TEMP/meta.tmp"
+          cp "$RUNNER_TEMP/meta.tmp" "$GITHUB_WORKSPACE/data/index/index-meta.json"
+          cp "$RUNNER_TEMP/meta.tmp" index-meta.json
+          git add index-meta.json
+          git commit -m "meta: backfill distCommit"
           git push --force origin dist
 
       # Prune only on main, so test smoke runs don't consume the retention quota.

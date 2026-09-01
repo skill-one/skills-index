@@ -48,7 +48,7 @@
 | 文件                                | 说明                                                                                                                     |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `index.jsonl`                       | 合并后的最终索引（以**技能**为单位平铺，**推荐直接消费这个**）                                                           |
-| `index-meta.json`                   | 索引自描述元数据：`generatedAt`（生成时间）、`counts`、`formatVersion`（字段变更时递增）                                 |
+| `index-meta.json`                   | 索引自描述元数据：`formatVersion`（字段变更时递增）、`generatedAt`（生成时间）、`counts.total`，以及 `distCommit`（承载本快照 `index.jsonl` 的 `dist` 分支 commit，由 CI 回填——见 [通过 CDN 访问](#通过-cdn-访问浏览器可直接用)） |
 | `data.tar.gz`                       | 完整数据快照（内部按 `skills-sh/` / `github/` / `index/` 分目录，仅含发布数据，不含流水线内部状态）                    |
 | `cache.tar.gz`                      | 增量扫描缓存（`cache/by-source/` 下的 per-repo 指纹），仅供下一轮 CI 恢复增量状态；数据消费者无需下载                   |
 | `fetched-skills.jsonl`              | skills.sh 原始数据汇总（中间产物）                                                                                       |
@@ -98,6 +98,12 @@ https://cdn.jsdelivr.net/gh/skill-one/skills-index@dist/index-meta.json
 ```
 
 > `dist` 分支每次全量发布时强推覆盖，始终指向最新一次 `main` 上的快照；仅 `main` 发布，冒烟测试不会覆盖它。
+
+生产环境的缓存方案建议用 **commit 定址**：先读 `index-meta.json` 拿到 `distCommit`，再通过该 commit 拉取正文。`@dist` 是可变 ref（CDN 缓存需要手动打散），而 commit sha 永不变化，因此 URL 可永久缓存、也不会取到陈旧快照：
+
+```
+https://cdn.jsdelivr.net/gh/skill-one/skills-index@<distCommit>/index.jsonl
+```
 
 也可在仓库 Releases 页面选择任意历史快照按需下载。保留最近 10 个 Release，超出部分自动清理。
 

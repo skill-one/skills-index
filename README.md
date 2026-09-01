@@ -48,7 +48,7 @@ Each Release contains:
 | File                                | Description                                                                                                              |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `index.jsonl`                       | The merged final index (flattened per **skill**; **recommended for direct consumption**)                                  |
-| `index-meta.json`                   | Self-describing index metadata: `generatedAt` (generation time), `counts`, `formatVersion` (bumped when fields change)    |
+| `index-meta.json`                   | Self-describing index metadata: `formatVersion` (bumped when fields change), `generatedAt` (generation time), `counts.total`, and `distCommit` (the `dist`-branch commit carrying this snapshot's `index.jsonl`, backfilled by CI — see [CDN access](#access-via-cdn-directly-usable-in-browsers)) |
 | `data.tar.gz`                       | Full data snapshot (internally organized into the `skills-sh/` / `github/` / `index/` directories; published data only, no pipeline-internal state) |
 | `cache.tar.gz`                      | Incremental scan cache (per-repo fingerprints under `cache/by-source/`), used only by the next CI run to restore incremental state; data consumers don't need to download it |
 | `fetched-skills.jsonl`              | Summarized raw skills.sh data (intermediate artifact)                                                                     |
@@ -100,6 +100,12 @@ https://cdn.jsdelivr.net/gh/skill-one/skills-index@dist/index-meta.json
 ```
 
 > The `dist` branch is force-pushed on every full release and always points to the latest snapshot from `main`; only `main` publishes — smoke tests never overwrite it.
+
+For production caching, prefer **commit-addressed URLs**: read `distCommit` from `index-meta.json` and fetch the body through that immutable ref. `@dist` is a mutable ref (its CDN cache must be busted manually), while a commit sha never changes, so the URL is cacheable forever and can never serve a stale snapshot:
+
+```
+https://cdn.jsdelivr.net/gh/skill-one/skills-index@<distCommit>/index.jsonl
+```
 
 You can also download any historical snapshot on demand from the Releases page. The most recent 10 Releases are retained; older ones are cleaned up automatically.
 

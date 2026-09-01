@@ -60,7 +60,7 @@ data/                                  # 发布数据（data.tar.gz，面向数�
     scanned-repos.jsonl              #   按仓库汇总（原始扫描顺序）
   index/                             # 第3步：最终产物
     index.jsonl                      #   最终索引（以 skill 为单位）
-    index-meta.json                  #   索引自描述元数据（generatedAt / counts / formatVersion）
+    index-meta.json                  #   索引自描述元数据（formatVersion / generatedAt / counts.total；distCommit 由 CI 回填）
 
 cache/                                 # 增量缓存（cache.tar.gz，仅供下一轮 CI 恢复）
   by-source/<owner>__<repo>/         # per-repo 状态；双下划线是 '/' 的无损替换
@@ -100,4 +100,4 @@ src/skills_index/
 
 ## CI
 
-数据由 GitHub Actions（`.github/workflows/daily.yml`）每日 UTC 0 点自动生成并发布为 Release：每次运行（含冒烟）先经 **lint + test 门禁**（ruff / mypy / pytest + 覆盖率，Python 3.11 与 3.13 双版本矩阵），通过后 `main` 全量 fetch、`test` 分支拉 1 页冒烟（冒烟 Release 标记为 prerelease，永不占用 `releases/latest`）；全量运行前从上一个 `data-` Release 恢复 `cache/by-source/` 增量指纹（下载其 `cache.tar.gz`），发布时把 `data/`（`data.tar.gz`，纯发布数据）与 `cache/`（`cache.tar.gz`，增量缓存）分开打包；`scanned-repos` 的两个排序视图在发布阶段由 CI 生成；`index.jsonl` 与 `index-meta.json` 额外强推到 `dist` 分支供 jsDelivr 等 CDN 访问；保留最近 10 个 Release。
+数据由 GitHub Actions（`.github/workflows/daily.yml`）每日 UTC 0 点自动生成并发布为 Release：每次运行（含冒烟）先经 **lint + test 门禁**（ruff / mypy / pytest + 覆盖率，Python 3.11 与 3.13 双版本矩阵），通过后 `main` 全量 fetch、`test` 分支拉 1 页冒烟（冒烟 Release 标记为 prerelease，永不占用 `releases/latest`）；全量运行前从上一个 `data-` Release 恢复 `cache/by-source/` 增量指纹（下载其 `cache.tar.gz`），发布时把 `data/`（`data.tar.gz`，纯发布数据）与 `cache/`（`cache.tar.gz`，增量缓存）分开打包；`scanned-repos` 的两个排序视图在发布阶段由 CI 生成；`index.jsonl` 与 `index-meta.json` 额外强推到 `dist` 分支供 jsDelivr 等 CDN 访问——推送分两个 commit，CI 把首个 commit 的 sha（两次 commit 中 `index.jsonl` 字节完全一致）回填为元数据的 `distCommit`，消费者即可用 immutable 的 commit 定址 URL 拉取正文；保留最近 10 个 Release。

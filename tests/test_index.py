@@ -81,7 +81,8 @@ def test_run_index_merges_scanned_into_fetched(
 def test_run_index_writes_meta_sidecar(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """index-meta.json 记录 generatedAt / counts / formatVersion / weeklyInstalls 语义。"""
+    """index-meta.json 只含运行期变化的字段（formatVersion / generatedAt /
+    counts.total）；静态 schema 说明归 README，distCommit 由 CI 推送后回填。"""
     fetched = [
         {"source": "owner/repo", "skillId": "a", "installs": 1},
         {"source": "owner/repo", "skillId": "b", "installs": 2},
@@ -102,13 +103,10 @@ def test_run_index_writes_meta_sidecar(
     assert meta["formatVersion"] == config.INDEX_FORMAT_VERSION
     # generatedAt 是秒级 UTC Z 格式。
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", meta["generatedAt"])
-    assert meta["counts"] == {
-        "total": len(records),
-        "withInstalls": 1,   # 只有 a 有榜单数据；gh-only 是 scan-only
-        "scanOnly": len(records) - 1,
-    }
-    assert meta["weeklyInstalls"] == {"order": "oldest-first", "maxWeeks": 8}
-    assert meta["stars"] == {"scope": "per-repo", "sharedBySkillsOfRepo": True}
+    assert meta["counts"] == {"total": len(records)}
+    # Exactly these keys: consumers may rely on the minimal shape, and a
+    # leaking static-schema or internal field would be a format regression.
+    assert set(meta) == {"formatVersion", "generatedAt", "counts"}
 
 
 def test_run_index_keeps_fetched_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

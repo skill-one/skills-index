@@ -166,9 +166,14 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
     write_jsonl(INDEX_JSONL, result)
 
     # Self-describing metadata for consumers: absolute generation time, the
-    # shape/semantics of weeklyInstalls, and a format version to detect
-    # incompatible snapshots without parsing every record.
-    with_installs = sum(1 for r in result if "installs" in r)
+    # total record count, and a format version to detect incompatible
+    # snapshots without parsing every record. Kept deliberately minimal:
+    # static schema notes (weeklyInstalls order/window, stars scope) live in
+    # the README field tables, not in every published snapshot.
+    # `distCommit` is NOT written here: the dist-branch commit that carries
+    # this snapshot's index.jsonl only exists after CI force-pushes dist, so
+    # CI backfills it into both the dist copy and the workspace copy (and
+    # thus the Release asset) right after the push.
     write_json(
         INDEX_META_JSON,
         {
@@ -176,15 +181,7 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
             "generatedAt": datetime.datetime.now(datetime.UTC).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             ),
-            "counts": {
-                "total": len(result),
-                "withInstalls": with_installs,
-                "scanOnly": len(result) - with_installs,
-            },
-            "weeklyInstalls": {"order": "oldest-first", "maxWeeks": 8},
-            # stars are repo-level: every skill of a repo carries the same
-            # count, as observed by the scan step at generatedAt time.
-            "stars": {"scope": "per-repo", "sharedBySkillsOfRepo": True},
+            "counts": {"total": len(result)},
         },
     )
     summary["scanned_merged"] = len(matched)

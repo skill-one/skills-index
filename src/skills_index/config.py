@@ -160,10 +160,14 @@ KEEP_FIELDS: set[str] = {"source", "skillId", "installs", "weeklyInstalls"}
 # Version of the published index format (index.jsonl + index-meta.json).
 # Bump when the record shape or field semantics change; consumers read it
 # from index-meta.json to detect incompatible snapshots.
+# v3: index-meta.json slimmed to {formatVersion, generatedAt, counts.total}
+#   and gained `distCommit` (backfilled by CI after the dist force-push);
+#   static schema notes (weeklyInstalls semantics, stars scope) moved to the
+#   README field tables.
 # v2: every record gained a repo-level `stars` field (stargazers_count of the
 #   skill's repository, fetched by the scan step); see index.run_index.
 # v1: initial format.
-INDEX_FORMAT_VERSION = 2
+INDEX_FORMAT_VERSION = 3
 
 # A GitHub source is `owner/repo` (contains a slash, is not a full URL).
 GITHUB_SOURCE = re.compile(r"^[^/\s]+/[^/\s]+$")
