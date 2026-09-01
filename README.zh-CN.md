@@ -22,7 +22,9 @@
     113781, 109199, 109085, 115475, 107969, 101120, 96861, 93130
   ],
   "path": "skills/find-skills",
-  "description": "Discover and install agent skills"
+  "description": "Discover and install agent skills",
+  "rev": "t1-8f3ac21d9b0c4e5f",
+  "firstSeenAt": "2026-08-24T14:20:17Z"
 }
 ```
 
@@ -35,11 +37,22 @@
 | `weeklyInstalls`  | 近 8 周周安装量（来自 skills.sh，按时间顺序）                        |
 | `path`            | 技能在仓库内的相对路径（如 `skills/find-skills`）                    |
 | `description`     | 技能说明（来自 `SKILL.md` frontmatter）                              |
+| `rev`             | 技能**目录**的内容指纹：`t1-` + 截断 sha256，覆盖目录内每个文件的（路径、git mode、blob sha）。内容变则必变 |
+| `firstSeenAt`     | 首次记录到该 `rev` 的那一轮索引的 UTC 时间，即"这个版本何时进入索引"   |
+
+### 版本与更新
+
+`rev` 是判断"已安装的技能是否过期"的**唯一**依据：安装时记下它，之后每次刷新做**相等**比较。它是摘要而非版本号——两个 `rev` 之间没有大小关系，因此不要写 `remote > local`，也不要自造 `v1/v2/v3` 计数（一旦上游回滚就露馅）。相等比较同时保证了零噪声：提交时间、作者、README 改动、同仓库其它技能的推送，都不会改变 `rev`。
+
+`firstSeenAt` 面向用户：可读的"3 天前更新"，以及待更新列表的排序键。它只随 `rev` 一起前进，所以可以安全地当作版本日期展示。`rev` 本身只在用户需要精确指认某一份内容时才露出（详情行、tooltip 里的 `8f3ac21d9b0c4e5f`，或更新提示中的 `8f3ac21 → b7d1f04`）；"跳过此版本"要存下的也正是这个值。
+
+指纹刻意不覆盖的东西：技能目录**之外**的文件（共享的 `../lib`、仓库级 `AGENTS.md`）以及归档里不存在的内容。作者在 frontmatter 里声明的 `version:` 同样不发布——约十分之一的技能写了它，且不保证随内容维护，因此无法充当变更探测器；想看改了什么请用提交历史链接：
+`https://github.com/<source>/commits/HEAD/<path>`。
 
 > 索引**不存储可直接访问的 `url`**；完整 GitHub 目录 URL 由 `source` + `path` 拼接得到：
 > `https://github.com/<source>/tree/HEAD/<path>`（`HEAD` 恒指向默认分支，分支变更也不受影响）。
 >
-> skills.sh 未收录的技能同样会进入索引，只是 `installs` / `weeklyInstalls` 字段不出现。每条记录都携带 `stars`。
+> skills.sh 未收录的技能同样会进入索引，只是 `installs` / `weeklyInstalls` 字段不出现。每条记录都携带 `stars`、`rev` 与 `firstSeenAt`。
 
 ## 发布的产物
 
@@ -50,7 +63,7 @@
 | `index.jsonl`                       | 合并后的最终索引（以**技能**为单位平铺，**推荐直接消费这个**）                                                           |
 | `index-meta.json`                   | 索引自描述元数据：`formatVersion`（字段变更时递增）、`generatedAt`（生成时间）、`counts.total`，以及 `distCommit`（承载本快照 `index.jsonl` 的 `dist` 分支 commit，由 CI 回填——见 [通过 CDN 访问](#通过-cdn-访问浏览器可直接用)） |
 | `data.tar.gz`                       | 完整数据快照（内部按 `skills-sh/` / `github/` / `index/` 分目录，仅含发布数据，不含流水线内部状态）                    |
-| `cache.tar.gz`                      | 增量扫描缓存（`cache/by-source/` 下的 per-repo 指纹），仅供下一轮 CI 恢复增量状态；数据消费者无需下载                   |
+| `cache.tar.gz`                      | 增量状态：`cache/by-source/` 下的 per-repo 指纹 + rev 账本 `cache/rev-ledger.jsonl`（让 `firstSeenAt` 在内容未变时保持稳定）。仅供下一轮 CI 恢复；数据消费者无需下载 |
 | `fetched-skills.jsonl`              | skills.sh 原始数据汇总（中间产物）                                                                                       |
 | `scanned-repos.jsonl`               | 按仓库汇总的扫描结果，**原始扫描顺序**（fetch 拉取到的顺序，未排序）                                                     |
 | `scanned-repos-by-stars.jsonl`      | 按 **star 数降序**排列的扫描结果                                                                                         |

@@ -17,6 +17,7 @@ from .config import (
     FETCHED_SKILLS,
     JSON,
     MAX_SKILL_COUNT,
+    SCANNED_FILE,
     SCANNED_REPOS,
     dir_to_source,
     iter_repo_dirs,
@@ -26,7 +27,7 @@ from .github import (
     extract_description,
     get_repo_metas,
     get_skill_contents,
-    get_tree_shas,
+    get_skill_tree_shas,
 )
 from .http import new_github_client
 from .io_utils import read_jsonl, write_jsonl
@@ -39,7 +40,7 @@ SCAN_WORKERS = 8
 
 
 def build_skill_records(
-    blobs: dict[str, tuple[str, str]],
+    revs: dict[str, str],
     contents: dict[str, str],
 ) -> list[JSON]:
     """Build a repo's scanned.jsonl records from its tarball, sorted by path.
@@ -48,10 +49,18 @@ def build_skill_records(
     every description is extracted locally — no per-file network fetches and
     no sha-based subsetting needed (that only paid off when each SKILL.md was
     fetched individually from the blob API).
+
+    `rev` is published per skill: it is the only value that lets a consumer
+    decide whether the skill it has installed still matches upstream, and the
+    index step derives `firstSeenAt` from it (see RevLedger).
     """
     return [
-        {"path": path, "description": extract_description(contents.get(path, ""))}
-        for _name, (path, _sha) in sorted(blobs.items(), key=lambda kv: kv[1][0])
+        {
+            "path": path,
+            "rev": rev,
+            "description": extract_description(contents.get(path, "")),
+        }
+        for path, rev in sorted(revs.items())
     ]
 
 
@@ -93,6 +102,9 @@ def _scan_one_repo(
             bump("failed")
         return None
     pushed, branch, stars = metas[source]
+    # Baseline for the next run's pre-check; stays None until we actually ask
+    # the Trees API (pre-check or the post-scan recording below).
+    tree_shas: dict[str, str] | None = None
 
     if not force:
         # Tombstoned mirror (loser of a previous run's fingerprint dedup):
@@ -151,27 +163,30 @@ def _scan_one_repo(
                 return cache.summarize()
 
             # Trees pre-check (warm cache only): a changed pushedAt does not
-            # necessarily mean the SKILL.md files changed. One Trees API call
-            # (shas from the same source as the local fingerprint) compares
-            # the repo's current public SKILL.md blob shas against the cache;
-            # on a full match (e.g. a README-only push) the tarball download
-            # is skipped and only the meta timestamps are refreshed. A cold
-            # cache (first scan) or a truncated tree goes straight to the
-            # tarball path (get_tree_shas returns None).
-            if cache.skill_shas:
+            # necessarily mean the skills changed. One Trees API call compares
+            # the repo's current {skill dir: git tree sha} map against the
+            # cached baseline; on a full match (e.g. a README-only push) the
+            # tarball download is skipped and only the meta timestamps are
+            # refreshed. A tree sha covers every file below the skill directory
+            # — content, names and modes — so a change confined to a bundled
+            # script cannot hide, which is what the previous SKILL.md-sha-only
+            # domain got wrong. A cold cache (first scan) or a truncated tree
+            # goes straight to the tarball; the baseline is then recorded after
+            # the scan below.
+            if cache.skill_tree_shas:
                 try:
-                    tree_shas = get_tree_shas(source, branch, client=client)
+                    tree_shas = get_skill_tree_shas(source, branch, client=client)
                 except Exception as exc:
                     print(f"  [tree] {source}: tree pre-check failed - {exc}; fetching tarball")
                     tree_shas = None
-                if tree_shas is not None and tree_shas == cache.skill_shas:
+                if tree_shas is not None and tree_shas == cache.skill_tree_shas:
                     bump("tree_skipped")
                     print(f"  [tree-skip] {source}: skills unchanged since {pushed}")
                     cache.refresh(pushed=pushed, stars=stars, now=now)
                     return cache.summarize()
 
     try:
-        blobs, contents, filtered_skills = get_skill_contents(
+        revs, contents, filtered_skills = get_skill_contents(
             source, branch, client=client
         )
     except Exception as exc:
@@ -181,7 +196,7 @@ def _scan_one_repo(
     if filtered_skills:
         bump("skills_filtered", filtered_skills)
 
-    skills = build_skill_records(blobs, contents)
+    skills = build_skill_records(revs, contents)
 
     # Repos whose skill count exceeds the cap (e.g. aggregator/awesome-list
     # repos) never enter the index: tombstone the cache (keeping the count
@@ -194,13 +209,22 @@ def _scan_one_repo(
         cache.write_filtered(pushed=pushed, now=now, skill_count=len(skills))
         return None
 
+    if tree_shas is None:
+        # Cold cache, forced rescan, or a pre-check we could not run: record the
+        # baseline now (one request per scanned repo) so the next run can use
+        # the cheap check instead of downloading this tarball again.
+        try:
+            tree_shas = get_skill_tree_shas(source, branch, client=client)
+        except Exception as exc:
+            print(f"  [tree] {source}: baseline fetch failed - {exc}")
+            tree_shas = None
     cache.write_ok(
         branch=branch,
         pushed=pushed,
         stars=stars,
         now=now,
         skills=skills,
-        skill_shas={path: sha for _name, (path, sha) in blobs.items()},
+        skill_tree_shas=tree_shas or {},
     )
     bump("updated")
     bump("new_skills", len(skills))
@@ -347,9 +371,9 @@ def scan_repositories(
     return summary
 
 
-def _content_fingerprint(shas: dict[str, str]) -> str:
-    """Stable serialization of a repo's skill tree ({path: blob sha})."""
-    return json.dumps(sorted(shas.items()), ensure_ascii=False)
+def _content_fingerprint(revs: dict[str, str]) -> str:
+    """Stable serialization of a repo's skill tree ({path: rev} map)."""
+    return json.dumps(sorted(revs.items()), ensure_ascii=False)
 
 
 def _dedup_repos(
@@ -357,25 +381,28 @@ def _dedup_repos(
 ) -> tuple[list[JSON], list[tuple[str, str]]]:
     """Drop mirror repos whose skill tree is byte-identical to another's.
 
-    Two repos with the same {path: blob sha} map carry exactly the same
-    SKILL.md files — an undiverged fork or copy. Within each identical group
-    only the most-starred repo survives (fetch order breaks ties); the rest
-    are removed from the summary and tombstoned via
-    :meth:`RepoCache.write_tombstone` (scanned.jsonl deleted, meta.json
-    replaced by a ``tombstoned`` marker), so their duplicate skills never
-    reach index.jsonl and later runs skip them without any network I/O (until
-    either repo pushes again, which invalidates the tombstone and triggers a
-    rescan). Repos with no skills have no fingerprint and are never deduped.
-    Returns ``(kept, [(loser, winner)])``.
+    Two repos with the same {path: rev} map carry exactly the same skill
+    content — an undiverged fork or copy, down to every bundled script and its
+    exec bit. Within each identical group only the most-starred repo survives
+    (fetch order breaks ties); the rest are removed from the summary and
+    tombstoned via :meth:`RepoCache.write_tombstone` (scanned.jsonl deleted,
+    meta.json replaced by a ``tombstoned`` marker), so their duplicate skills
+    never reach index.jsonl and later runs skip them without any network I/O
+    (until either repo pushes again, which invalidates the tombstone and
+    triggers a rescan). The fingerprint comes from scanned.jsonl, so it exists
+    after any successful scan — unlike the Trees baseline, which a failed
+    request may leave empty. Repos with no skills have no fingerprint and are
+    never deduped. Returns ``(kept, [(loser, winner)])``.
     """
     pushed_at = {str(r.get("source", "")): r.get("pushedAt") for r in repos}
     groups: dict[str, list[JSON]] = {}
     for r in repos:
         source = str(r.get("source", ""))
-        shas = RepoCache.load(base_dir / source_to_dir(source), source).skill_shas
-        if not shas:
+        skills = read_jsonl(base_dir / source_to_dir(source) / SCANNED_FILE)
+        revs = {str(s["path"]): str(s["rev"]) for s in skills if s.get("rev")}
+        if not revs:
             continue
-        groups.setdefault(_content_fingerprint(shas), []).append(r)
+        groups.setdefault(_content_fingerprint(revs), []).append(r)
 
     losers: dict[str, str] = {}
     for group in groups.values():

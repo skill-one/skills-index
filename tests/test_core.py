@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 import tarfile
 from pathlib import Path
 
@@ -17,6 +18,9 @@ from skills_index.github import (
 )
 from skills_index.io_utils import read_jsonl, write_jsonl
 from skills_index.scan import build_skill_records
+
+# Published rev shape: algorithm tag + truncated sha256 (see config.REV_*).
+REV_RE = re.compile(r"^t1-[0-9a-f]{16}$")
 
 
 def _make_tarball(files: dict[str, bytes]) -> bytes:
@@ -74,7 +78,7 @@ def test_read_jsonl_missing_file(tmp_path: Path) -> None:
     assert read_jsonl(tmp_path / "nope.jsonl") == []
 
 
-def test_parse_tarball_finds_skill_blobs() -> None:
+def test_parse_tarball_finds_skill_revs() -> None:
     raw = _make_tarball(
         {
             "skills/foo/SKILL.md": b"---\nname: foo\ndescription: Foo\n---\n",
@@ -82,11 +86,19 @@ def test_parse_tarball_finds_skill_blobs() -> None:
             "skills/bar/baz/SKILL.md": b"---\nname: baz\ndescription: Baz\n---\n",
         }
     )
-    blobs, contents, filtered = _parse_tarball(raw)
-    assert blobs == {
-        "foo": ("skills/foo", _git_blob_sha(b"---\nname: foo\ndescription: Foo\n---\n")),
-        "baz": ("skills/bar/baz", _git_blob_sha(b"---\nname: baz\ndescription: Baz\n---\n")),
-    }
+    revs, contents, filtered = _parse_tarball(raw)
+    assert set(revs) == {"skills/foo", "skills/bar/baz"}
+    assert all(REV_RE.fullmatch(rev) for rev in revs.values())
+    # 目录内非 SKILL.md 文件同样属于该单元的指纹域。
+    only_skill = _parse_tarball(
+        _make_tarball(
+            {
+                "skills/foo/SKILL.md": b"---\nname: foo\ndescription: Foo\n---\n",
+                "skills/bar/baz/SKILL.md": b"---\nname: baz\ndescription: Baz\n---\n",
+            }
+        )
+    )[0]
+    assert only_skill["skills/foo"] != revs["skills/foo"]
     assert contents["skills/foo"] == "---\nname: foo\ndescription: Foo\n---\n"
     assert filtered == 0
 
@@ -99,8 +111,8 @@ def test_parse_tarball_skips_non_skill_files() -> None:
             "README.md": b"nope",
         }
     )
-    blobs, _contents, filtered = _parse_tarball(raw)
-    assert blobs == {}
+    revs, _contents, filtered = _parse_tarball(raw)
+    assert revs == {}
     assert filtered == 0
 
 
@@ -119,13 +131,9 @@ def test_parse_tarball_filters_internal_paths() -> None:
             "skills/deprecated/old/SKILL.md": b"---\ndescription: Old\n---\n",
         }
     )
-    blobs, contents, filtered = _parse_tarball(raw)
+    revs, contents, filtered = _parse_tarball(raw)
     assert filtered == 5
-    assert set(blobs) == {"foo", "e2e"}
-    assert blobs["foo"] == (
-        "skills/foo",
-        _git_blob_sha(b"---\nname: foo\ndescription: Real foo\n---\n"),
-    )
+    assert set(revs) == {"skills/foo", "skills/e2e"}
     assert "tests/foo" not in contents
     assert contents["skills/e2e"] == "---\nname: e2e\ndescription: E2E skill\n---\n"
 
@@ -139,9 +147,9 @@ def test_parse_tarball_filters_nonpublic_frontmatter() -> None:
             "skills/ok/SKILL.md": b"---\nname: ok\ndescription: public\n---\n",
         }
     )
-    blobs, contents, filtered = _parse_tarball(raw)
+    revs, contents, filtered = _parse_tarball(raw)
     assert filtered == 3
-    assert set(blobs) == {"ok"}
+    assert set(revs) == {"skills/ok"}
     assert contents["skills/ok"] == "---\nname: ok\ndescription: public\n---\n"
 
 
@@ -160,9 +168,9 @@ def test_parse_tarball_filters_invalid_frontmatter() -> None:
             "skills/ok/SKILL.md": b"---\nname: ok\ndescription: fine\n---\n",
         }
     )
-    blobs, _contents, filtered = _parse_tarball(raw)
+    revs, _contents, filtered = _parse_tarball(raw)
     assert filtered == 7
-    assert set(blobs) == {"ok"}
+    assert set(revs) == {"skills/ok"}
 
 
 def test_parse_tarball_nested_skill_md_is_payload() -> None:
@@ -184,8 +192,8 @@ def test_parse_tarball_nested_skill_md_is_payload() -> None:
             "tests/x/y/SKILL.md": ok,  # payload → 不重复计数
         }
     )
-    blobs, contents, filtered = _parse_tarball(raw)
-    assert set(blobs) == {"foo", "bar"}
+    revs, contents, filtered = _parse_tarball(raw)
+    assert set(revs) == {"skills/foo", "skills/category/bar"}
     assert "skills/foo/nested" not in contents
     assert filtered == 3  # bad(S4) + hidden(S3) + tests/x(S2)；嵌套 payload 不计
 
@@ -200,8 +208,8 @@ def test_parse_tarball_siblings_under_category_dirs_are_kept() -> None:
             "other/e/SKILL.md": ok,
         }
     )
-    blobs, _contents, filtered = _parse_tarball(raw)
-    assert set(blobs) == {"c", "d", "e"}
+    revs, _contents, filtered = _parse_tarball(raw)
+    assert set(revs) == {"skills/a/b/c", "skills/a/b/d", "other/e"}
     assert filtered == 0
 
 
@@ -329,23 +337,20 @@ def test_extract_description_missing_returns_empty() -> None:
 
 
 def test_build_skill_records_sorts_by_path_and_parses_locally() -> None:
-    blobs = {
-        "b": ("skills/b", "sha-b"),
-        "a": ("skills/a", "sha-a"),
-    }
+    revs = {"skills/b": "t1-b", "skills/a": "t1-a"}
     contents = {
         "skills/a": "---\ndescription: A\n---\n",
         "skills/b": "---\ndescription: B\n---\n",
     }
-    assert build_skill_records(blobs, contents) == [
-        {"path": "skills/a", "description": "A"},
-        {"path": "skills/b", "description": "B"},
+    assert build_skill_records(revs, contents) == [
+        {"path": "skills/a", "rev": "t1-a", "description": "A"},
+        {"path": "skills/b", "rev": "t1-b", "description": "B"},
     ]
 
 
 def test_build_skill_records_missing_content_yields_empty_description() -> None:
-    assert build_skill_records({"a": ("skills/a", "sha-a")}, {}) == [
-        {"path": "skills/a", "description": ""}
+    assert build_skill_records({"skills/a": "t1-a"}, {}) == [
+        {"path": "skills/a", "rev": "t1-a", "description": ""}
     ]
 
 

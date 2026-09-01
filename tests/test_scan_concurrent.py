@@ -34,7 +34,7 @@ def _make_by_source(base_dir: Path) -> None:
         (repo_dir / config.META_FILE).write_text(
             f'{{"schemaVersion": {config.SCHEMA_VERSION}, "status": "ok", '
             f'"pushedAt": "{prev_pushed}", "stars": {i * 100}, '
-            f'"skillCount": 1, "skillShas": {{}}}}'
+            f'"skillCount": 1, "skillTreeShas": {{}}}}'
         )
         (repo_dir / config.SCANNED_FILE).write_text(
             '{"path": "skills/a", "description": "cached"}\n'
@@ -62,9 +62,9 @@ def patched(monkeypatch, tmp_path):
     def fake_contents(source, branch, *, client=None):
         with lock:
             seen_threads.add(threading.get_ident())
-        # (blobs, contents, filtered): 每次重扫上报 1 个被过滤的技能。
+        # (revs, contents, filtered): 每次重扫上报 1 个被过滤的技能。
         return (
-            {"a": ("skills/a", f"sha-{source}")},
+            {"skills/a": f"rev-{source}"},
             {"skills/a": "---\ndescription: desc for a\n---\n"},
             1,
         )
@@ -104,7 +104,12 @@ def test_scan_writes_per_repo_artifacts(patched):
         assert meta["pushedAt"] == OWNERS[source][0]  # updated to new pushed
         assert meta["stars"] == OWNERS[source][2]  # stargazers persisted
         skills = read_jsonl(repo_dir / config.SCANNED_FILE)
-        assert skills == [{"path": "skills/a", "description": "desc for a"}]
+        assert skills == [
+            {"path": "skills/a", "rev": f"rev-{source}", "description": "desc for a"}
+        ]
+        # 基准取不到（Trees 请求失败）不阻塞扫描：空 map 会在下次推送时
+        # 预检不命中而自然重录。
+        assert meta["skillTreeShas"] == {}
     # Up-to-date repos (1-3) keep their cached description untouched.
     for i in range(1, 4):
         source = f"owner{i}/repo{i}"
@@ -188,10 +193,10 @@ def test_scan_dedups_identical_skill_trees(monkeypatch, tmp_path):
 
     def fake_contents(source, branch, *, client=None):
         if source == "other/repo":
-            return {"o": ("skills/o", "sha-o")}, {"skills/o": "---\ndescription: O\n---\n"}, 0
+            return {"skills/o": "rev-o"}, {"skills/o": "---\ndescription: O\n---\n"}, 0
         # big/repo 与 small/mirror：同一棵技能树（path + blob sha 完全一致）。
         return (
-            {"a": ("skills/a", "sha-a"), "b": ("skills/b", "sha-b")},
+            {"skills/a": "rev-a", "skills/b": "rev-b"},
             {
                 "skills/a": "---\ndescription: A\n---\n",
                 "skills/b": "---\ndescription: B\n---\n",
@@ -215,7 +220,7 @@ def test_scan_dedups_identical_skill_trees(monkeypatch, tmp_path):
     assert meta["dedupedInto"] == "big/repo"
     assert meta["winnerPushedAt"] == "2024-01-01T00:00:00Z"
     assert meta["pushedAt"] == "2024-01-01T00:00:00Z"
-    assert "skillShas" not in meta  # 无过期指纹，无效化后的重扫必走 tarball
+    assert "skillTreeShas" not in meta  # 无过期指纹，无效化后的重扫必走 tarball
     assert not (mirror_dir / config.SCANNED_FILE).exists()
     # 仅统计幸存仓库的技能（big/repo 2 个 + other/repo 1 个）。
     assert summary["skills_scanned"] == 3
@@ -242,7 +247,7 @@ def test_scan_tombstoned_mirror_skipped_until_push(monkeypatch, tmp_path):
 
     def fake_contents(source, branch, *, client=None):
         downloads["n"] += 1
-        return ({"a": ("skills/a", "sha-a")}, {"skills/a": "---\ndescription: A\n---\n"}, 0)
+        return ({"skills/a": "rev-a"}, {"skills/a": "---\ndescription: A\n---\n"}, 0)
 
     monkeypatch.setattr(scan_mod, "get_repo_metas", fake_metas)
     monkeypatch.setattr(scan_mod, "get_skill_contents", fake_contents)
@@ -293,10 +298,10 @@ def test_scan_tombstoned_mirror_resurrected_when_diverged(monkeypatch, tmp_path)
         downloads["n"] += 1
         if source == "big/repo" or not downloads["diverged"]:
             # 分叉前：两仓指纹全等；分叉后：仅胜者保持原树。
-            return ({"a": ("skills/a", "sha-a")}, {"skills/a": "---\ndescription: A\n---\n"}, 0)
+            return ({"skills/a": "rev-a"}, {"skills/a": "---\ndescription: A\n---\n"}, 0)
         # 镜像新增了一个技能：与胜者不再全等。
         return (
-            {"a": ("skills/a", "sha-a"), "c": ("skills/c", "sha-c")},
+            {"skills/a": "rev-a", "skills/c": "rev-c"},
             {
                 "skills/a": "---\ndescription: A\n---\n",
                 "skills/c": "---\ndescription: C\n---\n",
@@ -360,11 +365,11 @@ def test_scan_tree_precheck_skips_tarball_on_skill_unchanged(monkeypatch, tmp_pa
     base_dir = tmp_path / "by-source"
     repo_dir = base_dir / config.source_to_dir("owner/repo")
     repo_dir.mkdir(parents=True)
-    # 上次扫描：pushedAt 较旧，skillShas 是本次 tree 预检的比对基准。
+    # 上次扫描：pushedAt 较旧，skillTreeShas 是本次 tree 预检的比对基准。
     (repo_dir / config.META_FILE).write_text(
         f'{{"schemaVersion": {config.SCHEMA_VERSION}, "status": "ok", '
         f'"pushedAt": "2024-01-01T00:00:00Z", "stars": 50, "skillCount": 1, '
-        f'"skillShas": {{"skills/a": "sha-a"}}}}'
+        f'"skillTreeShas": {{"skills/a": "tree-a"}}}}'
     )
     (repo_dir / config.SCANNED_FILE).write_text(
         '{"path": "skills/a", "description": "cached"}\n'
@@ -380,13 +385,13 @@ def test_scan_tree_precheck_skips_tarball_on_skill_unchanged(monkeypatch, tmp_pa
     )
 
     def fake_tree(source, branch, *, client=None):
-        # pushedAt 变了，但 SKILL.md 的 sha 与缓存一致（README-only push）。
-        return {"skills/a": "sha-a"}
+        # pushedAt 变了，但技能目录的 tree sha 与缓存一致（README-only push）。
+        return {"skills/a": "tree-a"}
 
     def _fail_tarball(*args, **kwargs):
         raise AssertionError("tarball must not be downloaded when tree pre-check hits")
 
-    monkeypatch.setattr(scan_mod, "get_tree_shas", fake_tree)
+    monkeypatch.setattr(scan_mod, "get_skill_tree_shas", fake_tree)
     monkeypatch.setattr(scan_mod, "get_skill_contents", _fail_tarball)
 
     summary = scan_repositories(base_dir=base_dir)
@@ -404,7 +409,8 @@ def test_scan_tree_precheck_skips_tarball_on_skill_unchanged(monkeypatch, tmp_pa
 
 
 def test_scan_tree_precheck_mismatch_downloads_tarball(monkeypatch, tmp_path):
-    """Trees 预检未命中（SKILL.md 有变化）→ 照常下载 tarball 走全量扫描。"""
+    """Trees 预检未命中（技能目录 tree sha 变了）→ 下载 tarball 全量扫描，
+    并复用预检已经拿到的 tree sha 作为下轮基准（不再多打一次请求）。"""
     OWNERS = {"owner/repo": ("2024-06-01T00:00:00Z", "main", 50)}
     base_dir = tmp_path / "by-source"
     repo_dir = base_dir / config.source_to_dir("owner/repo")
@@ -412,10 +418,10 @@ def test_scan_tree_precheck_mismatch_downloads_tarball(monkeypatch, tmp_path):
     (repo_dir / config.META_FILE).write_text(
         f'{{"schemaVersion": {config.SCHEMA_VERSION}, "status": "ok", '
         f'"pushedAt": "2024-01-01T00:00:00Z", "stars": 50, "skillCount": 1, '
-        f'"skillShas": {{"skills/a": "sha-old"}}}}'
+        f'"skillTreeShas": {{"skills/a": "tree-old"}}}}'
     )
     (repo_dir / config.SCANNED_FILE).write_text(
-        '{"path": "skills/a", "description": "old"}\n'
+        '{"path": "skills/a", "rev": "t1-old", "description": "old"}\n'
     )
 
     monkeypatch.setattr(scan_mod, "SCANNED_REPOS", tmp_path / "scanned-repos.jsonl")
@@ -425,16 +431,19 @@ def test_scan_tree_precheck_mismatch_downloads_tarball(monkeypatch, tmp_path):
         "get_repo_metas",
         lambda sources, *, client=None, max_workers=8: (dict(OWNERS), set()),
     )
-    # tree 返回的 sha 与缓存不同（技能文件变了）。
-    monkeypatch.setattr(
-        scan_mod, "get_tree_shas",
-        lambda source, branch, *, client=None: {"skills/a": "sha-new"},
-    )
+    tree_calls = []
+
+    def fake_tree(source, branch, *, client=None):
+        tree_calls.append(source)
+        return {"skills/a": "tree-new"}
+
+    # tree 与缓存不同（技能文件变了）。
+    monkeypatch.setattr(scan_mod, "get_skill_tree_shas", fake_tree)
     monkeypatch.setattr(
         scan_mod,
         "get_skill_contents",
         lambda source, branch, *, client=None: (
-            {"a": ("skills/a", "sha-new")},
+            {"skills/a": "rev-new"},
             {"skills/a": "---\ndescription: fresh desc\n---\n"},
             0,
         ),
@@ -445,8 +454,12 @@ def test_scan_tree_precheck_mismatch_downloads_tarball(monkeypatch, tmp_path):
     assert summary["repos_tree_skipped"] == 0
     assert summary["repos_updated"] == 1
     assert read_jsonl(repo_dir / config.SCANNED_FILE) == [
-        {"path": "skills/a", "description": "fresh desc"}
+        {"path": "skills/a", "rev": "rev-new", "description": "fresh desc"}
     ]
+    meta = read_json(repo_dir / config.META_FILE)
+    assert meta["skillTreeShas"] == {"skills/a": "tree-new"}
+    # 预检那次请求即可复用：本轮只打了一次 Trees。
+    assert tree_calls == ["owner/repo"]
 
 
 def test_scan_tree_precheck_error_falls_back_to_tarball(monkeypatch, tmp_path):
@@ -458,7 +471,7 @@ def test_scan_tree_precheck_error_falls_back_to_tarball(monkeypatch, tmp_path):
     (repo_dir / config.META_FILE).write_text(
         f'{{"schemaVersion": {config.SCHEMA_VERSION}, "status": "ok", '
         f'"pushedAt": "2024-01-01T00:00:00Z", "stars": 50, "skillCount": 1, '
-        f'"skillShas": {{"skills/a": "sha-a"}}}}'
+        f'"skillTreeShas": {{"skills/a": "tree-a"}}}}'
     )
     (repo_dir / config.SCANNED_FILE).write_text(
         '{"path": "skills/a", "description": "cached"}\n'
@@ -475,12 +488,12 @@ def test_scan_tree_precheck_error_falls_back_to_tarball(monkeypatch, tmp_path):
     def broken_tree(source, branch, *, client=None):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(scan_mod, "get_tree_shas", broken_tree)
+    monkeypatch.setattr(scan_mod, "get_skill_tree_shas", broken_tree)
     monkeypatch.setattr(
         scan_mod,
         "get_skill_contents",
         lambda source, branch, *, client=None: (
-            {"a": ("skills/a", "sha-a")},
+            {"skills/a": "rev-a"},
             {"skills/a": "---\ndescription: desc\n---\n"},
             0,
         ),
@@ -494,8 +507,9 @@ def test_scan_tree_precheck_error_falls_back_to_tarball(monkeypatch, tmp_path):
     assert summary["repos_tree_skipped"] == 0
 
 
-def test_scan_tree_precheck_cold_cache_skips_precheck(monkeypatch, tmp_path):
-    """无 blobShas 缓存（首次扫描）不调用 Trees API，直接下载 tarball。"""
+def test_scan_cold_cache_skips_precheck_but_records_baseline(monkeypatch, tmp_path):
+    """冷缓存（首次扫描）不做预检——没有可比基准——直接下载 tarball；扫描后
+    补一次 Trees 记下基准，下一轮推送才能走廉价预检而不是重复下载 tarball。"""
     OWNERS = {"owner/repo": ("2024-06-01T00:00:00Z", "main", 50)}
     base_dir = tmp_path / "by-source"
     repo_dir = base_dir / config.source_to_dir("owner/repo")
@@ -510,23 +524,34 @@ def test_scan_tree_precheck_cold_cache_skips_precheck(monkeypatch, tmp_path):
         lambda sources, *, client=None, max_workers=8: (dict(OWNERS), set()),
     )
 
-    def _fail_tree(*args, **kwargs):
-        raise AssertionError("tree pre-check must not run on a cold cache")
+    tree_calls = {"n": 0}
 
-    monkeypatch.setattr(scan_mod, "get_tree_shas", _fail_tree)
-    monkeypatch.setattr(
-        scan_mod,
-        "get_skill_contents",
-        lambda source, branch, *, client=None: (
-            {"a": ("skills/a", "sha-a")},
+    def counting_tree(source, branch, *, client=None):
+        tree_calls["n"] += 1
+        return {"skills/a": "tree-a"}
+
+    scanned = {"n": 0}
+
+    def fake_contents(source, branch, *, client=None):
+        scanned["n"] += 1
+        assert tree_calls["n"] == 0  # 预检必须先于 tarball 被跳过
+        return (
+            {"skills/a": "rev-a"},
             {"skills/a": "---\ndescription: desc\n---\n"},
             0,
-        ),
-    )
+        )
+
+    monkeypatch.setattr(scan_mod, "get_skill_tree_shas", counting_tree)
+    monkeypatch.setattr(scan_mod, "get_skill_contents", fake_contents)
 
     summary = scan_repositories(base_dir=base_dir)
 
     assert summary["repos_updated"] == 1
+    assert scanned["n"] == 1
+    # 恰好一次：扫描后的基准记录，不是预检。
+    assert tree_calls["n"] == 1
+    meta = read_json(repo_dir / config.META_FILE)
+    assert meta["skillTreeShas"] == {"skills/a": "tree-a"}
 
 
 def test_scan_max_skill_count_zero_disables_cap(monkeypatch, tmp_path):
@@ -540,12 +565,12 @@ def test_scan_max_skill_count_zero_disables_cap(monkeypatch, tmp_path):
         "get_repo_metas",
         lambda sources, *, client=None, max_workers=8: (dict(OWNERS), set()),
     )
-    blobs = {f"s{i}": (f"skills/s{i}", f"sha-{i}") for i in range(501)}
+    revs = {f"skills/s{i}": f"rev-{i}" for i in range(501)}
     contents = {f"skills/s{i}": f"---\ndescription: s{i}\n---\n" for i in range(501)}
     monkeypatch.setattr(
         scan_mod,
         "get_skill_contents",
-        lambda source, branch, *, client=None: (blobs, contents, 0),
+        lambda source, branch, *, client=None: (revs, contents, 0),
     )
 
     summary = scan_repositories(max_skill_count=0, base_dir=base_dir)
@@ -575,7 +600,7 @@ def test_scan_filters_high_skillcount_repos(monkeypatch, tmp_path):
 
     owner1 is up-to-date with a cached skillCount=600 (>500) -> filtered via
     the up-to-date branch. owner4 is stale and, when rescanned, yields 501
-    skill blobs (>500) -> filtered via the scan branch. owner2/3 (up-to-date)
+    skill revs (>500) -> filtered via the scan branch. owner2/3 (up-to-date)
     and owner5/6 (stale, 1 skill) are kept.
     """
     OWNERS = {
@@ -592,7 +617,7 @@ def test_scan_filters_high_skillcount_repos(monkeypatch, tmp_path):
         (repo_dir / config.META_FILE).write_text(
             f'{{"schemaVersion": {config.SCHEMA_VERSION}, "status": "ok", '
             f'"pushedAt": "{prev_pushed}", "stars": {i * 100}, '
-            f'"skillCount": {cached_skill}, "skillShas": {{}}}}'
+            f'"skillCount": {cached_skill}, "skillTreeShas": {{}}}}'
         )
         (repo_dir / config.SCANNED_FILE).write_text(
             '{"path": "skills/a", "description": "cached"}\n'
@@ -606,14 +631,14 @@ def test_scan_filters_high_skillcount_repos(monkeypatch, tmp_path):
 
     def fake_contents(source, branch, *, client=None):
         if source == "owner4/repo4":
-            # 501 skill blobs -> exceeds the default cap of 500.
-            blobs = {f"s{i}": (f"skills/s{i}", f"sha-{i}") for i in range(501)}
+            # 501 skill revs -> exceeds the default cap of 500.
+            revs = {f"skills/s{i}": f"rev-{i}" for i in range(501)}
             contents = {
                 f"skills/s{i}": f"---\ndescription: s{i}\n---\n" for i in range(501)
             }
-            return blobs, contents, 0
+            return revs, contents, 0
         # Per-source sha keeps each repo's skill-tree fingerprint distinct
-        # (identical skillShas would trip the mirror dedup).
+        # (identical skillTreeShas would trip the mirror dedup).
         return (
             {"a": ("skills/a", f"sha-{source}")},
             {"skills/a": "---\ndescription: desc\n---\n"},
@@ -643,7 +668,7 @@ def test_scan_filters_high_skillcount_repos(monkeypatch, tmp_path):
         assert meta["status"] == "filtered"
         assert meta["skillCount"] == count
         assert meta["pushedAt"] == OWNERS[source][0]
-        assert "skillShas" not in meta
+        assert "skillTreeShas" not in meta
     # Kept repos retain their cache.
     assert (base_dir / config.source_to_dir("owner2/repo2") / config.SCANNED_FILE).exists()
     assert (base_dir / config.source_to_dir("owner5/repo5") / config.SCANNED_FILE).exists()
@@ -669,9 +694,9 @@ def test_scan_filtered_repo_skipped_until_push(monkeypatch, tmp_path):
 
     def fake_contents(source, branch, *, client=None):
         downloads["n"] += 1
-        blobs = {f"s{i}": (f"skills/s{i}", f"sha-{i}") for i in range(501)}
+        revs = {f"skills/s{i}": f"rev-{i}" for i in range(501)}
         contents = {f"skills/s{i}": f"---\ndescription: s{i}\n---\n" for i in range(501)}
-        return blobs, contents, 0
+        return revs, contents, 0
 
     monkeypatch.setattr(scan_mod, "get_repo_metas", fake_metas)
     monkeypatch.setattr(scan_mod, "get_skill_contents", fake_contents)
@@ -714,7 +739,7 @@ def test_scan_purges_legacy_files_on_skip(monkeypatch, tmp_path):
     (repo_dir / config.META_FILE).write_text(
         f'{{"schemaVersion": {config.SCHEMA_VERSION}, "status": "ok", '
         f'"pushedAt": "2024-01-01T00:00:00Z", "stars": 50, "skillCount": 1, '
-        f'"skillShas": {{}}}}'
+        f'"skillTreeShas": {{}}}}'
     )
     (repo_dir / config.SCANNED_FILE).write_text(
         '{"path": "skills/a", "description": "cached"}\n'

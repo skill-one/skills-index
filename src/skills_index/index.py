@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime
 from pathlib import Path
 
-from .cache import RepoCache
+from .cache import RepoCache, RevLedger
 from .config import (
     BY_SOURCE_DIR,
     FETCHED_SKILLS,
@@ -13,6 +13,7 @@ from .config import (
     INDEX_JSONL,
     INDEX_META_JSON,
     JSON,
+    REV_LEDGER,
     SCANNED_FILE,
     Record,
     dir_to_source,
@@ -29,6 +30,8 @@ _INDEX_FIELD_ORDER = (
     "installs",
     "weeklyInstalls",
     "path",
+    "rev",
+    "firstSeenAt",
 )
 
 
@@ -88,7 +91,9 @@ def _strip_metadata(rec: Record) -> Record:
     return rec
 
 
-def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, JSON]]:
+def run_index(
+    base_dir: Path = BY_SOURCE_DIR, *, now: str | None = None
+) -> tuple[list[Record], dict[str, JSON]]:
     """Merge every repo's scanned skills with skills.sh metadata into index.jsonl.
 
     - each repo's `scanned.jsonl` is the baseline: every scanned skill is
@@ -104,10 +109,16 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
       dropped: only skills a repo scan confirms belong in the index.
     - output order: skills with fetched data keep the skills.sh ranking order;
       scan-only skills are appended at the end.
+    - every skill carries the `rev` its scan computed, plus `firstSeenAt`: the
+      run that first recorded that rev, resolved through the cross-run ledger
+      (see :class:`RevLedger`). Nothing else can tell two skills of the same
+      name apart, and `firstSeenAt` only moves when content does.
 
-    Returns ``(index_records, summary)`` where ``summary`` holds counts for the
-    run report.
+    `now` (second-precision UTC) is injectable so stamped dates are testable
+    without waiting on a clock. Returns ``(index_records, summary)`` where
+    ``summary`` holds counts for the run report.
     """
+    now = now or datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     # Index only merges skills whose repo was scanned in step 2. Step 2
     # tombstones repos above the skillCount cap (config.MAX_SKILL_COUNT),
     # removing their scanned.jsonl, so those repos never reach this step.
@@ -127,6 +138,8 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
         "scan_only": 0,
         "not_in_repo": 0,
         "deduped_skills": 0,
+        "rev_refreshed": 0,
+        "ledger_total": 0,
         "index": 0,
     }
 
@@ -163,7 +176,13 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
     result += [_ordered(_strip_metadata(rec)) for rec in scan_only]
     # 跨仓库重复（skillId + description 双匹配）只保留 installs 更高者。
     result, deduped = _dedup_skills(result)
+    # Stamped after dedup so the ledger records exactly what gets published: a
+    # skill dropped as a mirror must not hold a row that would resurface its
+    # date if it ever wins again.
+    ledger = RevLedger.load(REV_LEDGER)
+    refreshed, ledger_total = ledger.stamp(result, now)
     write_jsonl(INDEX_JSONL, result)
+    ledger.save(REV_LEDGER)
 
     # Self-describing metadata for consumers: absolute generation time, the
     # total record count, and a format version to detect incompatible
@@ -178,9 +197,7 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
         INDEX_META_JSON,
         {
             "formatVersion": INDEX_FORMAT_VERSION,
-            "generatedAt": datetime.datetime.now(datetime.UTC).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
+            "generatedAt": now,
             "counts": {"total": len(result)},
         },
     )
@@ -188,12 +205,15 @@ def run_index(base_dir: Path = BY_SOURCE_DIR) -> tuple[list[Record], dict[str, J
     summary["scan_only"] = len(scan_only)
     summary["not_in_repo"] = len(fetched) - len(matched_keys)
     summary["deduped_skills"] = deduped
+    summary["rev_refreshed"] = refreshed
+    summary["ledger_total"] = ledger_total
     summary["index"] = len(result)
     msg = (
         f"[index] merged {len(matched)} scanned with skills.sh data, "
         f"{len(scan_only)} scan-only (no installs data), "
         f"dropped {summary['not_in_repo']} not-in-repo"
         + (f", deduped {deduped} cross-repo" if deduped else "")
+        + f", rev refreshed for {refreshed}/{len(result)}"
         + f" -> {len(result)} in {INDEX_JSONL}"
     )
     print(msg)

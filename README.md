@@ -22,7 +22,9 @@ The final index `index.jsonl` is **flattened per skill**, one skill per line:
     113781, 109199, 109085, 115475, 107969, 101120, 96861, 93130
   ],
   "path": "skills/find-skills",
-  "description": "Discover and install agent skills"
+  "description": "Discover and install agent skills",
+  "rev": "t1-8f3ac21d9b0c4e5f",
+  "firstSeenAt": "2026-08-24T14:20:17Z"
 }
 ```
 
@@ -35,11 +37,22 @@ The final index `index.jsonl` is **flattened per skill**, one skill per line:
 | `weeklyInstalls`  | Weekly installs over the last 8 weeks (from skills.sh, chronological)  |
 | `path`            | Skill's path relative to the repository root (e.g. `skills/find-skills`) |
 | `description`     | Skill description (from the `SKILL.md` frontmatter)                    |
+| `rev`             | Content fingerprint of the skill **directory**: `t1-` plus a truncated sha256 over every file's (path, git mode, blob sha). Changes exactly when the skill's content does |
+| `firstSeenAt`     | UTC timestamp of the index run that first recorded this `rev` — i.e. when this version appeared in the index |
+
+### Versions and updates
+
+`rev` is the **only** field that decides whether an installed skill is current: record it when you install, compare for **equality** on every refresh. It is a digest, not a version number — two revs have no ordering, so never write `remote > local`, and never invent a `v1/v2/v3` counter of your own (a rollback would break it). Equality also means noise is impossible: commit times, authors, README edits and pushes that touch other skills of the same repository all leave `rev` untouched.
+
+`firstSeenAt` is for humans: a readable "updated 3 days ago" and a sort key for lists of pending updates. It advances only together with `rev`, which is what makes it safe to display as a version date. Show `rev` itself only where users need to name an exact build (a detail row, `8f3ac21d9b0c4e5f` in a tooltip, or `8f3ac21 → b7d1f04` in an update prompt); that value is also what a "skip this version" choice should store.
+
+What the fingerprint deliberately does not cover: files **outside** the skill directory (a shared `../lib`, a repository-level `AGENTS.md`) and upstream content the archive does not contain. Author-declared `version:` frontmatter is not published either — roughly one skill in ten declares it, and it is not maintained, so it cannot be a change detector; use the commit history link if you want to read what changed:
+`https://github.com/<source>/commits/HEAD/<path>`.
 
 > The index **does not store a ready-to-use `url`**; compose the full GitHub directory URL from `source` + `path`:
 > `https://github.com/<source>/tree/HEAD/<path>` (`HEAD` always resolves to the default branch, so it is unaffected by branch changes).
 >
-> Skills not tracked by skills.sh are still included in the index; they simply lack the `installs` / `weeklyInstalls` fields. Every record carries `stars`.
+> Skills not tracked by skills.sh are still included in the index; they simply lack the `installs` / `weeklyInstalls` fields. Every record carries `stars`, `rev` and `firstSeenAt`.
 
 ## Published artifacts
 
@@ -50,7 +63,7 @@ Each Release contains:
 | `index.jsonl`                       | The merged final index (flattened per **skill**; **recommended for direct consumption**)                                  |
 | `index-meta.json`                   | Self-describing index metadata: `formatVersion` (bumped when fields change), `generatedAt` (generation time), `counts.total`, and `distCommit` (the `dist`-branch commit carrying this snapshot's `index.jsonl`, backfilled by CI — see [CDN access](#access-via-cdn-directly-usable-in-browsers)) |
 | `data.tar.gz`                       | Full data snapshot (internally organized into the `skills-sh/` / `github/` / `index/` directories; published data only, no pipeline-internal state) |
-| `cache.tar.gz`                      | Incremental scan cache (per-repo fingerprints under `cache/by-source/`), used only by the next CI run to restore incremental state; data consumers don't need to download it |
+| `cache.tar.gz`                      | Incremental state: per-repo fingerprints under `cache/by-source/` plus the rev ledger `cache/rev-ledger.jsonl` (which lets `firstSeenAt` stay put while a skill's content is unchanged). Used only by the next CI run; data consumers don't need to download it |
 | `fetched-skills.jsonl`              | Summarized raw skills.sh data (intermediate artifact)                                                                     |
 | `scanned-repos.jsonl`               | Per-repository scan results in **original scan order** (the order fetch pulled them in, unsorted)                         |
 | `scanned-repos-by-stars.jsonl`      | Scan results sorted by **star count, descending**                                                                         |

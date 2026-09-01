@@ -154,11 +154,14 @@ def _build_summary(
         )
     lines += [
         f"- **Final index entries: `{index_sum.get('index', 0)}`**",
+        f"- New/changed revs this run: `{index_sum.get('rev_refreshed', 0)}` "
+        f"(ledger rows: `{index_sum.get('ledger_total', 0)}`)",
         "",
         "### Artifacts",
         "- `data.tar.gz` — published `data/` tree (no pipeline-internal state)",
-        "- `cache.tar.gz` — per-repo incremental scan cache (`cache/by-source/`, "
-        "restored by the next CI run)",
+        "- `cache.tar.gz` — incremental state restored by the next CI run: the "
+        "per-repo scan cache (`cache/by-source/`) plus the rev ledger "
+        "(`cache/rev-ledger.jsonl`)",
         "- `index.jsonl` — merged skills index",
         "- `index-meta.json` — index metadata (generatedAt / counts / format version)",
         "- `fetched-skills.jsonl` — raw skills.sh data",

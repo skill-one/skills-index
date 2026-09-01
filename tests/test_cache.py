@@ -18,7 +18,7 @@ def test_load_missing_meta_yields_empty_cache(tmp_path: Path) -> None:
     assert cache.status == ""
     assert cache.pushed_at == ""
     assert cache.skill_count == 0
-    assert cache.skill_shas == {}
+    assert cache.skill_tree_shas == {}
     assert not cache.has_data
     assert cache.schema_stale  # missing meta always counts as stale
 
@@ -32,7 +32,7 @@ def test_write_ok_roundtrip(tmp_path: Path) -> None:
         stars=7,
         now="2024-06-01T00:00:00Z",
         skills=skills,
-        skill_shas={"skills/a": "sha-a"},
+        skill_tree_shas={"skills/a": "sha-a"},
     )
 
     assert cache.has_data
@@ -48,7 +48,7 @@ def test_write_ok_roundtrip(tmp_path: Path) -> None:
         "stars": 7,
         "lastScanned": "2024-06-01T00:00:00Z",
         "skillCount": 1,
-        "skillShas": {"skills/a": "sha-a"},
+        "skillTreeShas": {"skills/a": "sha-a"},
     }
 
 
@@ -60,7 +60,7 @@ def test_refresh_updates_bookkeeping_only(tmp_path: Path) -> None:
         stars=7,
         now="2024-06-01T00:00:00Z",
         skills=[{"path": "skills/a", "description": "A"}],
-        skill_shas={"skills/a": "sha-a"},
+        skill_tree_shas={"skills/a": "sha-a"},
     )
 
     cache.refresh(pushed="2024-02-01T00:00:00Z", stars=9, now="2024-06-02T00:00:00Z")
@@ -68,7 +68,7 @@ def test_refresh_updates_bookkeeping_only(tmp_path: Path) -> None:
     meta = read_json(cache.repo_dir / "meta.json")
     assert meta["pushedAt"] == "2024-02-01T00:00:00Z"
     assert meta["stars"] == 9
-    assert meta["skillShas"] == {"skills/a": "sha-a"}  # fingerprint untouched
+    assert meta["skillTreeShas"] == {"skills/a": "sha-a"}  # fingerprint untouched
     assert (cache.repo_dir / "scanned.jsonl").exists()  # data untouched
 
 
@@ -80,7 +80,7 @@ def test_write_filtered_tombstone_keeps_count_drops_data(tmp_path: Path) -> None
         stars=7,
         now="2024-06-01T00:00:00Z",
         skills=[{"path": "skills/a", "description": "A"}],
-        skill_shas={"skills/a": "sha-a"},
+        skill_tree_shas={"skills/a": "sha-a"},
     )
 
     cache.write_filtered(
@@ -90,7 +90,7 @@ def test_write_filtered_tombstone_keeps_count_drops_data(tmp_path: Path) -> None
     assert meta["status"] == "filtered"
     assert meta["skillCount"] == 600
     assert meta["pushedAt"] == "2024-01-01T00:00:00Z"
-    assert "skillShas" not in meta
+    assert "skillTreeShas" not in meta
     assert not (cache.repo_dir / "scanned.jsonl").exists()
 
     cache.write_tombstone(
@@ -128,7 +128,7 @@ def test_remove_drops_whole_repo_dir(tmp_path: Path) -> None:
         stars=1,
         now="n",
         skills=[],
-        skill_shas={},
+        skill_tree_shas={},
     )
 
     cache.remove()

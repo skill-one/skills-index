@@ -1,16 +1,16 @@
-"""Per-repo incremental cache under ``cache/by-source/<owner>__<repo>/``.
+"""Cross-run cache state: per-repo scan fingerprints plus the rev ledger.
 
-One directory per repository holds the only cross-run state the scan step
-needs (see config.CACHE_DIR):
+``cache/by-source/<owner>__<repo>/`` — one directory per repository holds the
+state the scan step needs (see config.CACHE_DIR):
 
 - ``meta.json``     state fingerprint. A single tagged shape: every record
                     carries ``schemaVersion`` / ``status`` / ``source`` /
                     ``lastScanned``, plus the fields of its status:
   - ``ok``          normal cache: ``branch`` / ``pushedAt`` / ``stars`` /
-                    ``skillCount`` / ``skillShas`` ({path: blob sha} of the
-                    repo's public SKILL.md files — the same domain the Trees
-                    API pre-check compares against, and the fingerprint the
-                    mirror dedup groups on).
+                    ``skillCount`` / ``skillTreeShas`` ({path: git tree sha} of
+                    the repo's public skill directories — the same domain the
+                    Trees API reports, and the fingerprint the mirror dedup
+                    groups on).
   - ``filtered``    repo excluded by the skillCount cap: ``pushedAt`` /
                     ``skillCount`` are kept so later runs skip it without a
                     tarball download until a new push triggers a full
@@ -18,7 +18,13 @@ needs (see config.CACHE_DIR):
   - ``tombstoned``  dedup loser (byte-identical mirror of another repo):
                     ``dedupedInto`` / ``winnerPushedAt`` / ``pushedAt``,
                     skipped with zero network I/O until either side pushes.
-- ``scanned.jsonl`` the repo's skill records; exists only for ``ok``.
+- ``scanned.jsonl`` the repo's skill records (path, ``rev``, description);
+                    exists only for ``ok``.
+
+``cache/rev-ledger.jsonl`` (config.REV_LEDGER, see :class:`RevLedger`) — one
+row per published skill holding its current ``rev`` and the run that first
+recorded it, which is what lets the index step publish a ``firstSeenAt`` that
+moves only when the content does.
 
 Every rewrite purges files outside this contract, so leftovers from older
 formats cannot accumulate.
@@ -63,9 +69,9 @@ class RepoCache:
         return int(self.meta.get("skillCount") or 0)
 
     @property
-    def skill_shas(self) -> dict[str, str]:
-        """{SKILL.md path: blob sha} of the cached public skills."""
-        shas = self.meta.get("skillShas")
+    def skill_tree_shas(self) -> dict[str, str]:
+        """{skill dir: git tree sha} of the cached public skills."""
+        shas = self.meta.get("skillTreeShas")
         if not isinstance(shas, dict):
             return {}
         return {str(k): str(v) for k, v in shas.items()}
@@ -100,9 +106,16 @@ class RepoCache:
         stars: int,
         now: str,
         skills: list[Record],
-        skill_shas: dict[str, str],
+        skill_tree_shas: dict[str, str],
     ) -> None:
-        """Persist a full scan result: scanned.jsonl + ``ok`` meta."""
+        """Persist a full scan result: scanned.jsonl + ``ok`` meta.
+
+        `skill_tree_shas` may be empty when this run could not get a Trees
+        baseline (cold cache, truncated tree, failed request). That costs the
+        next push one redundant tarball download and nothing else: the empty map
+        never matches a real tree, so the pre-check falls through and records a
+        fresh baseline then.
+        """
         self.repo_dir.mkdir(parents=True, exist_ok=True)
         write_jsonl(self.repo_dir / SCANNED_FILE, skills)
         self.meta = {
@@ -114,7 +127,7 @@ class RepoCache:
             "stars": stars,
             "lastScanned": now,
             "skillCount": len(skills),
-            "skillShas": skill_shas,
+            "skillTreeShas": skill_tree_shas,
         }
         self._write_meta()
 
@@ -184,3 +197,88 @@ class RepoCache:
     def _write_meta(self) -> None:
         self.purge_foreign_files()
         write_json(self.repo_dir / META_FILE, self.meta)
+
+
+# A ledger row is addressed by the skill it describes.
+LedgerKey = tuple[str, str]
+
+
+class RevLedger:
+    """Cross-run memory of each published skill's content fingerprint.
+
+    One row per ``(source, path)``: the skill's current ``rev`` and
+    ``firstSeenAt``, the UTC timestamp of the run that first recorded that rev.
+    The size is one row per published skill (never a history), so it does not
+    grow with the number of upstream releases.
+
+    :meth:`stamp` is what turns a rev into a date without any network access: a
+    skill whose rev matches the ledger inherits the recorded date, a skill whose
+    rev differs (or that was never seen) gets this run's timestamp. That makes
+    the published date move *exactly* when the content changes — unlike the
+    repository's ``pushedAt``, which advances on commits touching other skills.
+    A rollback to previous content resets the date to the current run: the row
+    only knows the rev it last recorded, and "first seen by this index" stays
+    true either way.
+    """
+
+    def __init__(self, entries: dict[LedgerKey, Record]) -> None:
+        self.entries = entries
+
+    @classmethod
+    def load(cls, path: Path) -> RevLedger:
+        """Read a ledger file; missing, corrupt or malformed rows yield an
+        empty ledger, which simply makes this run seed every date."""
+        out: dict[LedgerKey, Record] = {}
+        for rec in read_jsonl(path):
+            key = (str(rec.get("source") or ""), str(rec.get("path") or ""))
+            rev = str(rec.get("rev") or "")
+            first = str(rec.get("firstSeenAt") or "")
+            if key[0] and key[1] and rev and first:
+                out[key] = {"source": key[0], "path": key[1], "rev": rev,
+                            "firstSeenAt": first}
+        return cls(out)
+
+    def stamp(self, records: list[Record], now: str) -> tuple[int, int]:
+        """Attach ``firstSeenAt`` to every rev-carrying record.
+
+        Returns ``(refreshed, total)``: how many rows were new or changed, and
+        the resulting ledger size. Records without a ``rev`` (a cache written
+        before the rev format) are left untouched — an unknown content is not
+        the same content, so they must neither inherit nor overwrite a date.
+
+        Rows of repositories absent from this run are kept: a failed scan
+        carries no information about the repo's skills, and dropping their rows
+        would make the next successful run report every one of them as newly
+        published.
+        """
+        fresh: dict[LedgerKey, Record] = {}
+        refreshed = 0
+        for rec in records:
+            rev = str(rec.get("rev") or "")
+            key = (str(rec.get("source") or ""), str(rec.get("path") or ""))
+            if not rev or not key[0] or not key[1]:
+                continue
+            prev = self.entries.get(key)
+            if prev is not None and prev["rev"] == rev:
+                first = str(prev["firstSeenAt"])
+            else:
+                first = now
+                refreshed += 1
+            rec["firstSeenAt"] = first
+            fresh[key] = {"source": key[0], "path": key[1], "rev": rev,
+                          "firstSeenAt": first}
+
+        scanned = {key[0] for key in fresh}
+        kept = {
+            key: row
+            for key, row in self.entries.items()
+            if key[0] not in scanned and key not in fresh
+        }
+        self.entries = {**fresh, **kept}
+        return refreshed, len(self.entries)
+
+    def save(self, path: Path) -> None:
+        """Persist the ledger sorted by (source, path), so an accidental edit
+        of the cached file produces a reviewable diff instead of churn."""
+        rows = [self.entries[k] for k in sorted(self.entries)]
+        write_jsonl(path, rows)

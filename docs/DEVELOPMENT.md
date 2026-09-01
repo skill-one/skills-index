@@ -30,10 +30,11 @@ A three-step pipeline (`update` chains them into one command):
 | --- | --- | --- | --- |
 | 1. fetch | `skills-index fetch` | Pull raw data from the skills.sh all-time leaderboard | `data/skills-sh/fetched-skills.jsonl` + `cache/by-source/*/` (directories created per source only) |
 | 2. scan | `skills-index scan` | Incrementally scan GitHub repos for `SKILL.md` | `data/github/scanned-repos.jsonl` + `cache/by-source/*/scanned.jsonl` + `meta.json` |
-| 3. index | `skills-index index` | Merge the previous two steps into the final index | `data/index/index.jsonl` + `index-meta.json` |
+| 3. index | `skills-index index` | Merge the previous two steps into the final index, and stamp each skill's version date through the cross-run rev ledger | `data/index/index.jsonl` + `index-meta.json` + `cache/rev-ledger.jsonl` |
 | 4. update | `skills-index update` | Steps 1–3 in one command (single entry point for local testing and CI) | all of the above |
 
-- **Incremental mechanism**: `scan` first skips unchanged repos by `pushed_at`; for repos with new pushes, one Trees API call compares the blob shas of all `SKILL.md` files and skips the tarball download when nothing changed; after passing the tree precheck, contents are parsed locally from the full tarball (traffic goes through codeload and does not consume REST quota). Mirror repos whose content fingerprints are identical are **tombstoned** by the dedup logic and skipped directly in later runs, until either side receives a new push and both are re-adjudicated.
+- **Incremental mechanism**: `scan` first skips unchanged repos by `pushed_at`; for repos with new pushes, one Trees API call compares the **git tree sha of every public skill directory** against the cached baseline and skips the tarball download when nothing changed (a tree sha covers the whole directory — content, file names and modes — so a change confined to a bundled script cannot hide, which the previous SKILL.md-sha domain got wrong). After any successful scan, the baseline is recorded for the next run (one request per scanned repo, reused from the pre-check when it already ran). Contents are then parsed locally from the full tarball (traffic goes through codeload and does not consume REST quota). Mirror repos whose per-skill `rev` maps are identical are **tombstoned** by the dedup logic and skipped directly in later runs, until either side receives a new push and both are re-adjudicated.
+- **Version fields**: `scan` derives each skill's `rev` (sha256 over the directory's sorted `(path, git mode, blob sha)` triples, published as `t1-<16 hex>`), and `index` publishes it together with `firstSeenAt` — the timestamp of the run that first recorded that rev, resolved through `cache/rev-ledger.jsonl`. The ledger holds one row per published skill (never a history), so its size tracks the index; rows of repositories missing from a run are kept, because a failed scan carries no information and must not reset a whole repo's dates.
 - **Failure safety**: in incremental `update` mode, when fetch has failed pages, stale-repo pruning (prune) is **skipped**, so repos that merely happen to fall on a failed page are not misjudged as vanished.
 - **Filtering**: the pipeline applies multi-layer filtering (repo-level / skill-level / merge-level); the full rules are documented in [FILTERING.md](FILTERING.md).
 - **Final index**: for the fields and consumption of `index.jsonl`, see [README.md](../README.md).
@@ -63,6 +64,7 @@ data/                                  # published data (data.tar.gz, for data c
     index-meta.json                    #   self-describing metadata (formatVersion / generatedAt / counts.total; CI backfills distCommit)
 
 cache/                                 # incremental cache (cache.tar.gz, for the next CI run to restore)
+  rev-ledger.jsonl                     # cross-run version ledger: one row per published skill (rev + firstSeenAt)
   by-source/<owner>__<repo>/           # per-repo state; '__' is a lossless stand-in for '/'
     scanned.jsonl / meta.json
 ```
@@ -71,10 +73,11 @@ cache/                                 # incremental cache (cache.tar.gz, for th
 
 - The two sorted views `scanned-repos-by-stars.jsonl` / `scanned-repos-by-skillcount.jsonl` are generated **by CI at publish time** from `scanned-repos.jsonl` (see daily.yml); the core pipeline produces only the single scan-order copy.
 - `cache/by-source/<owner>__<repo>/meta.json` is a single shape tagged by `status` (see `src/skills_index/cache.py`):
-  - `ok` — a normal cache: `branch` / `pushedAt` / `stars` / `skillCount` / `skillShas` (the `{path: blob sha}` fingerprint of the repo's public skills, serving both as the Trees-precheck comparison domain and as the mirror-dedup fingerprint);
+  - `ok` — a normal cache: `branch` / `pushedAt` / `stars` / `skillCount` / `skillTreeShas` (the `{path: git tree sha}` baseline of the repo's public skill directories, compared against the Trees API on the next run; it may be empty when that request failed, which only costs one redundant tarball download);
   - `filtered` — excluded for exceeding the skillCount cap: keeps `pushedAt` + `skillCount`; later runs skip it without a tarball until the repo receives a new push and is re-adjudicated;
   - `tombstoned` — eliminated by mirror dedup: `dedupedInto` + `winnerPushedAt` + `pushedAt`, until either side receives a new push.
-  - `scanned.jsonl` exists only in the `ok` state; every rewrite cleans leftover files outside the contract out of the directory.
+  - `scanned.jsonl` exists only in the `ok` state and carries one `{path, rev, description}` record per skill; every rewrite cleans leftover files outside the contract out of the directory.
+- `cache/rev-ledger.jsonl` is written by the **index** step, not by `scan`, and lives at the cache root on purpose: `clean_workspace` wipes only `cache/by-source/` and `RepoCache` purges only files inside a repo directory, so the ledger survives both while still being packaged into `cache.tar.gz`.
 
 > Artifacts store only `path`, never `url`; compose the full GitHub directory link from `source` + `path` as `https://github.com/<source>/tree/HEAD/<path>`.
 
@@ -87,15 +90,15 @@ src/skills_index/
 ├── config.py     # constants, paths (data/ and cache/ registries), filter rules, token discovery, source<->dir mapping (leaf module)
 ├── http.py       # thin httpx wrapper: client, retries, GitHub auth, rate-limit backoff
 ├── io_utils.py   # JSON / JSONL read-write helpers
-├── cache.py      # per-repo incremental cache (cache/by-source): RepoCache reads, writes for the three statuses, leftover cleanup
-├── github.py     # GitHub interface: repo metadata, Trees precheck, codeload tarball parsing
+├── cache.py      # cross-run state: RepoCache (per-repo fingerprints) + RevLedger (rev -> firstSeenAt)
+├── github.py     # GitHub interface: repo metadata, Trees precheck, codeload tarball parsing, skill_rev
 ├── fetch.py      # pull skills.sh -> filter -> distribute by source; includes prune_stale_repos
 ├── scan.py       # incremental scan (pushed_at / Trees precheck / fingerprints) + aggregation + mirror dedup
-└── index.py      # merge fetched + scanned, generate data/index.jsonl
+└── index.py      # merge fetched + scanned, stamp rev/firstSeenAt, generate data/index.jsonl
 ```
 
-Dependencies are acyclic: `config` is the leaf, depended on by all other modules; `http` depends only on `config`; `cache` depends on `config` / `io_utils`; `github` / `fetch` depend on `http` / `config` / `io_utils`; `scan` additionally depends on `cache`; `cli` only orchestrates and implements no business logic.
+Dependencies are acyclic: `config` is the leaf, depended on by all other modules; `http` depends only on `config`; `cache` depends on `config` / `io_utils`; `github` / `fetch` depend on `http` / `config` / `io_utils`; `scan` and `index` additionally depend on `cache` (fingerprints / rev ledger); `cli` only orchestrates and implements no business logic.
 
 ## CI
 
-Data is generated and published as a Release automatically every day at 00:00 UTC by GitHub Actions (`.github/workflows/daily.yml`): every run (including smoke) first passes a **lint + test gate** (ruff / mypy / pytest + coverage, on a Python 3.11 and 3.13 matrix); once through, `main` runs a full fetch and the `test` branch pulls 1 page as a smoke run (smoke releases are marked prerelease and never occupy `releases/latest`); before a full run, the `cache/by-source/` incremental fingerprints are restored from the previous `data-` release (downloading its `cache.tar.gz`); at publish time `data/` (`data.tar.gz`, pure published data) and `cache/` (`cache.tar.gz`, incremental cache) are packaged separately; the two sorted views of `scanned-repos` are generated by CI at the publish stage; `index.jsonl` and `index-meta.json` are additionally force-pushed to the `dist` branch for access via jsDelivr and other CDNs — the push happens in two commits so CI can backfill `distCommit` (the first commit's sha, whose `index.jsonl` bytes are identical) into the metadata, giving consumers an immutable, commit-addressed URL for the body; the most recent 10 Releases are retained.
+Data is generated and published as a Release automatically every day at 00:00 UTC by GitHub Actions (`.github/workflows/daily.yml`): every run (including smoke) first passes a **lint + test gate** (ruff / mypy / pytest + coverage, on a Python 3.11 and 3.13 matrix); once through, `main` runs a full fetch and the `test` branch pulls 1 page as a smoke run (smoke releases are marked prerelease and never occupy `releases/latest`); before a full run, the incremental state (`cache/by-source/` fingerprints and the root-level rev ledger) is restored from the previous `data-` release (downloading its `cache.tar.gz`); at publish time `data/` (`data.tar.gz`, pure published data) and `cache/` (`cache.tar.gz`, incremental cache) are packaged separately; the two sorted views of `scanned-repos` are generated by CI at the publish stage; `index.jsonl` and `index-meta.json` are additionally force-pushed to the `dist` branch for access via jsDelivr and other CDNs — the push happens in two commits so CI can backfill `distCommit` (the first commit's sha, whose `index.jsonl` bytes are identical) into the metadata, giving consumers an immutable, commit-addressed URL for the body; the most recent 10 Releases are retained.

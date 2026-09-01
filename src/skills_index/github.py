@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import tarfile
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -19,7 +20,13 @@ from urllib.parse import quote
 import httpx
 import yaml
 
-from .config import HIDDEN_FRONTMATTER_MARKERS, JSON, is_internal_skill_path
+from .config import (
+    HIDDEN_FRONTMATTER_MARKERS,
+    JSON,
+    REV_ALGO_TAG,
+    REV_DIGEST_HEX,
+    is_internal_skill_path,
+)
 from .http import HttpError, get_json, new_github_client
 
 # codeload serves archive downloads and is not part of the REST API rate limit.
@@ -51,10 +58,66 @@ def _git_blob_sha(content: bytes) -> str:
     return hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
 
 
+# Git object modes. Git tracks only the exec bit, so a file is 100644 or
+# 100755 no matter what the tarball's umask says; 120000 is a symlink whose
+# blob content is the link target.
+GIT_MODE_FILE = "100644"
+GIT_MODE_EXEC = "100755"
+GIT_MODE_SYMLINK = "120000"
+
+# One file inside a skill directory: (path relative to that directory, git
+# object mode, git blob sha). A skill's `rev` is a digest of this triple set.
+SkillFile = tuple[str, str, str]
+
+
+def _git_mode(member: tarfile.TarInfo) -> str:
+    """Git object mode for a tar member (symlink, exec bit, or plain file)."""
+    if member.issym():
+        return GIT_MODE_SYMLINK
+    return GIT_MODE_EXEC if member.mode & 0o111 else GIT_MODE_FILE
+
+
+def dir_owner(rel: str, dirs: Iterable[str]) -> str | None:
+    """Return the skill dir claiming `rel`, or None when no dir does.
+
+    Candidates are checked from the shortest prefix up, and `_outermost_skill_dirs`
+    guarantees claimed dirs never nest inside each other, so the first hit is
+    also the only one: everything below a skill directory (including a nested
+    `SKILL.md`) is that unit's payload and belongs to its fingerprint.
+    """
+    wanted = set(dirs)
+    parts = rel.split("/")
+    for i in range(1, len(parts)):
+        cand = "/".join(parts[:i])
+        if cand in wanted:
+            return cand
+    return None
+
+
+def skill_rev(files: Iterable[SkillFile]) -> str:
+    """Content fingerprint of one skill directory: `"<tag>-<sha256[:n]>"`.
+
+    The digest covers every file in the directory — `SKILL.md` plus scripts,
+    templates and nested payload — over the canonicalized set of
+    (relative path, git mode, blob sha) triples, so it changes exactly when
+    the skill's content does: a byte inside any file, a file added, removed or
+    renamed, and even a `chmod +x` (which decides whether a bundled script can
+    run). It ignores commit time, author, message, branch, and anything outside
+    the directory, so unrelated pushes never bump it.
+
+    Paths are relative to the skill directory, so the same content at different
+    paths — or in a fork or mirror of the repo — yields the same `rev`, which is
+    what makes it usable as a cross-repo identity of one piece of content.
+    """
+    canon = json.dumps(sorted(files), ensure_ascii=False)
+    digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+    return f"{REV_ALGO_TAG}-{digest[:REV_DIGEST_HEX]}"
+
+
 def _scan_repo(  # noqa: E501
     source: str, branch: str, *, client: httpx.Client
-) -> tuple[dict[str, tuple[str, str]], dict[str, str], int]:
-    """Download and scan a repo tarball; return (blobs, contents, filtered)."""
+) -> tuple[dict[str, str], dict[str, str], int]:
+    """Download and scan a repo tarball; return (revs, contents, filtered)."""
     owner, repo = _split(source)
     url = f"{CODELOAD}/{owner}/{repo}/tar.gz/{quote(branch, safe='')}"
     resp = client.get(url)
@@ -64,48 +127,54 @@ def _scan_repo(  # noqa: E501
 
 def get_skill_contents(  # noqa: E501
     source: str, branch: str = "HEAD", *, client: httpx.Client | None = None
-) -> tuple[dict[str, tuple[str, str]], dict[str, str], int]:
-    """Return (blobs, contents, filtered_count) for every public, valid SKILL.md.
+) -> tuple[dict[str, str], dict[str, str], int]:
+    """Return (revs, contents, filtered_count) for every public, valid SKILL.md.
 
-    - blobs:    {basename: (relative_path, blob_sha)}
-    - contents: {relative_path: raw SKILL.md text}
+    - revs:     {skill dir: content fingerprint} (see `skill_rev`)
+    - contents: {skill dir: raw SKILL.md text}
 
     Backed by a single codeload tarball download (not billed to the REST
-    quota); the blob sha is computed locally with git's exact algorithm, so
-    the repo-level fingerprints are comparable across runs and match the
-    Trees API shas used by `get_tree_shas`. SKILL.md files on internal paths
-    (tests/examples/...), marked non-public, or lacking the required
-    frontmatter fields (`is_invalid_frontmatter`) are filtered out and
+    quota); every blob sha inside a skill directory is computed locally with
+    git's exact algorithm, so a rev is reproducible across runs, machines and
+    mirrors — the same content always hashes to the same value. SKILL.md files
+    on internal paths (tests/examples/...), marked non-public, or lacking the
+    required frontmatter fields (`is_invalid_frontmatter`) are filtered out and
     counted in the third value. Nested SKILL.md files — those inside another
     skill's directory — are payload of that skill unit, not candidates, and
-    are skipped without entering the counter (see `_outermost_skill_dirs`).
+    are skipped without entering the counter (see `_outermost_skill_dirs`);
+    their bytes still count toward the owning unit's `rev`.
     """
     client = client or new_github_client()
     return _scan_repo(source, branch, client=client)
 
 
-def get_tree_shas(
+def get_skill_tree_shas(
     source: str, branch: str, *, client: httpx.Client | None = None
 ) -> dict[str, str] | None:
-    """Return {relative_path: blob_sha} for every public-path SKILL.md.
+    """Return {skill dir: git tree sha} for every public skill of a repo.
 
-    One Trees API call (recursive) per repo — the sha values are identical to
-    the locally computed `_git_blob_sha` fingerprints, so callers can compare
-    them against the cached `meta.json` skillShas to decide whether any
-    public SKILL.md changed since the last scan (e.g. a README-only push
-    would show an unchanged set, and the tarball download can be skipped
-    entirely). Internal paths (tests/examples/... — see
-    `is_internal_skill_path`) are excluded so the comparison domain matches
-    the cached fingerprint, which only covers public skills; nested SKILL.md
-    dirs (payload of an enclosing skill unit, see `_outermost_skill_dirs`)
-    are excluded for the same reason. SKILL.md files dropped by content-level
-    filters (frontmatter markers, missing required fields) cannot be
-    recognized from the tree alone, so repos carrying those simply never hit
-    the pre-check (conservative: they fall through to the tarball).
+    One Trees API call (recursive) per repo. GitHub reports a tree sha for each
+    directory, which commits every file below it — content, names and modes —
+    so a repo whose skills are untouched yields an identical map across pushes
+    (a README-only push changes none of them) and its tarball download can be
+    skipped, while a change confined to a bundled script cannot hide.
+
+    This is a change detector only, and it is compared exclusively against the
+    same kind of value the previous scan stored — never against the published
+    `rev`, which is a local digest of the same territory (see `skill_rev`).
+    Keeping the two independent is what lets `rev` be a plain canonical hash
+    without any obligation to reproduce git's tree serialization.
+
+    The domain matches the tarball scan: internal paths (tests/examples/... —
+    see `is_internal_skill_path`) and nested `SKILL.md` dirs (payload of an
+    enclosing unit, see `_outermost_skill_dirs`) are excluded. SKILL.md files
+    dropped by content-level filters (frontmatter markers, missing required
+    fields) cannot be recognized from the tree alone, so repos carrying those
+    simply never match the pre-check (conservative: they fall through to the
+    tarball, which is always authoritative).
 
     Returns `None` when the tree is truncated (>100k entries / 7MB response)
-    or the request fails: the caller should fall back to downloading the
-    tarball, which is always authoritative.
+    or the request fails: the caller should fall back to the tarball.
     """
     owner, repo = _split(source)
     c = client or new_github_client()
@@ -113,16 +182,16 @@ def get_tree_shas(
     if data.get("truncated"):
         print(f"  [tree] {source}: tree truncated; falling back to tarball")
         return None
-    shas = {
-        e["path"][: -len("/SKILL.md")]: e["sha"]
-        for e in data.get("tree", [])
-        if e.get("type") == "blob"
-        and e.get("path", "").endswith("/SKILL.md")
+    entries = data.get("tree", []) or []
+    paths = {str(e.get("path", "")) for e in entries}
+    skill_dirs = {p[: -len("/SKILL.md")] for p in paths if p.endswith("/SKILL.md")}
+    keep = {
+        d for d in _outermost_skill_dirs(skill_dirs) if not is_internal_skill_path(d)
     }
     return {
-        d: shas[d]
-        for d in _outermost_skill_dirs(shas)
-        if not is_internal_skill_path(d)
+        str(e["path"]): str(e["sha"])
+        for e in entries
+        if e.get("type") == "tree" and str(e.get("path", "")) in keep
     }
 
 
@@ -152,37 +221,41 @@ def _outermost_skill_dirs(dirs: Iterable[str]) -> list[str]:
 
 def _parse_tarball(  # noqa: E501
     raw: bytes,
-) -> tuple[dict[str, tuple[str, str]], dict[str, str], int]:
-    """Scan a repo tarball for every SKILL.md; return (blobs, contents, filtered).
+) -> tuple[dict[str, str], dict[str, str], int]:
+    """Scan a repo tarball for every SKILL.md; return (revs, contents, filtered).
 
-    Non-public SKILL.md files are dropped before the basename-keyed dict is
-    built, so a same-named test fixture can never shadow the real skill:
-    internal paths (tests/examples/templates/... -- see `is_internal_skill_path`),
+    Non-public SKILL.md files are dropped before any result is built, so a
+    same-named test fixture can never shadow the real skill: internal paths
+    (tests/examples/templates/... -- see `is_internal_skill_path`),
     non-public frontmatter markers (`is_nonpublic_frontmatter`), and files
     without the required `name` + `description` frontmatter
     (`is_invalid_frontmatter`) all count toward `filtered`. Nested SKILL.md
     files (inside another skill's directory) are payload of that skill unit:
     they are skipped before the filter chain and do not count toward
-    `filtered` — they were never candidates (see `_outermost_skill_dirs`).
+    `filtered` — they were never candidates (see `_outermost_skill_dirs`) —
+    but their bytes do enter the owning unit's `rev`, together with every other
+    file under that unit's directory.
 
     The tarball has a top-level `<repo>-<sha>/` directory, which is stripped so
-    `relative_path` is the path within the repo (as used elsewhere).
+    paths are repo-relative (as used elsewhere); fingerprint entries are
+    relative to the owning skill directory (see `skill_rev`).
     """
     skill_members: dict[str, tarfile.TarInfo] = {}
+    members: dict[str, tarfile.TarInfo] = {}
     with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
         for member in tf.getmembers():
-            if not member.isfile():
+            if not (member.isfile() or member.issym()):
                 continue
             parts = member.name.split("/", 1)
             if len(parts) < 2:
                 continue  # the top-level directory entry itself
             rel = parts[1]
-            if not rel.endswith("/SKILL.md"):
-                continue
-            skill_members[rel[: -len("/SKILL.md")]] = member
+            members[rel] = member
+            if rel.endswith("/SKILL.md"):
+                skill_members[rel[: -len("/SKILL.md")]] = member
 
-        blobs: dict[str, tuple[str, str]] = {}
         contents: dict[str, str] = {}
+        survivors: list[str] = []
         filtered = 0
         for skill_dir in _outermost_skill_dirs(skill_members):
             if is_internal_skill_path(skill_dir):
@@ -191,14 +264,38 @@ def _parse_tarball(  # noqa: E501
             f = tf.extractfile(skill_members[skill_dir])
             if f is None:
                 continue
-            data = f.read()
-            text = data.decode("utf-8", errors="replace")
+            text = f.read().decode("utf-8", errors="replace")
             if is_nonpublic_frontmatter(text) or is_invalid_frontmatter(text):
                 filtered += 1
                 continue
-            blobs[skill_dir.rsplit("/", 1)[-1]] = (skill_dir, _git_blob_sha(data))
             contents[skill_dir] = text
-    return blobs, contents, filtered
+            survivors.append(skill_dir)
+
+        per_dir: dict[str, list[SkillFile]] = {d: [] for d in survivors}
+        for rel, member in members.items():
+            unit = dir_owner(rel, per_dir)
+            if unit is not None:
+                per_dir[unit].append(_skill_file(tf, rel, unit, member))
+        revs = {d: skill_rev(files) for d, files in per_dir.items()}
+    return revs, contents, filtered
+
+
+def _skill_file(
+    tf: tarfile.TarFile, rel: str, unit: str, member: tarfile.TarInfo
+) -> SkillFile:
+    """One (path inside the skill dir, git mode, blob sha) entry for `member`.
+
+    A symlink's blob is its target string (git stores links that way, and the
+    Trees API reports the same sha), so a retargeted link changes the
+    fingerprint without any file content being touched.
+    """
+    inner = rel[len(unit) + 1 :]
+    mode = _git_mode(member)
+    if member.issym():
+        return (inner, mode, _git_blob_sha(member.linkname.encode("utf-8")))
+    handle = tf.extractfile(member)
+    data = handle.read() if handle is not None else b""
+    return (inner, mode, _git_blob_sha(data))
 
 
 def parse_frontmatter(markdown: str) -> dict[str, JSON]:

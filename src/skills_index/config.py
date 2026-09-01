@@ -72,6 +72,14 @@ PUBLISHED_FILES: tuple[Path, ...] = (
 # next CI run can restore the incremental chain.
 BY_SOURCE_DIR = CACHE_DIR / "by-source"
 
+# Cross-run memory of what each published skill's content looked like last time
+# (one row per skill: current `rev` + the run that first recorded it). Lives at
+# the CACHE_DIR root rather than under by-source/, because `clean_workspace`
+# wipes only the per-repo tree and RepoCache purges only files inside a repo
+# dir — a root-level file therefore survives both, while still riding along in
+# cache.tar.gz (the whole cache/ tree is packaged and restored by CI).
+REV_LEDGER = CACHE_DIR / "rev-ledger.jsonl"
+
 # 仓库 skillCount 过滤上限：scan 与 index 均会丢弃 skillCount > MAX_SKILL_COUNT
 # 的仓库（例如聚合型 / awesome-list 类仓库会捆绑过量技能，稀释索引质量）。
 # 设为 0 可关闭该上限。
@@ -138,6 +146,10 @@ SCANNED_FILE = "scanned.jsonl"
 META_FILE = "meta.json"
 
 # Bump when the scan output format changes so stale caches are rebuilt once.
+# v7: 指纹升级为「目录级内容指纹」——skillShas ({path: SKILL.md blob sha}) 换成
+#   skillRevs ({path: rev}，rev 覆盖技能目录内全部文件)，scanned.jsonl 每条技能
+#   新增 `rev` 字段。旧缓存既没有 rev 也带着过窄的预检域（附属文件变更会被
+#   误判为「技能未变」而跳过 tarball），必须整体重建一次。
 # v6: 收录域收紧，需一次性重建：
 #   1) SKILL.md 有效性判定——frontmatter 必须含非空的 name + description
 #      （agent skills 规范必备字段，见 github.is_invalid_frontmatter），否则
@@ -151,7 +163,7 @@ META_FILE = "meta.json"
 #   Pre-v5 caches are rebuilt once on the next scan.
 # v4: skill 级过滤（内部路径 + 非公开 frontmatter 标记）——v3 缓存的
 # scanned.jsonl 可能含非公开技能，需要重建。
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Fields kept from the skills.sh payload. No URL is persisted: consumers
 # reconstruct the GitHub directory URL from `source` + `path` (see README).
@@ -160,6 +172,10 @@ KEEP_FIELDS: set[str] = {"source", "skillId", "installs", "weeklyInstalls"}
 # Version of the published index format (index.jsonl + index-meta.json).
 # Bump when the record shape or field semantics change; consumers read it
 # from index-meta.json to detect incompatible snapshots.
+# v4: every record gained a per-skill content fingerprint `rev` (whole skill
+#   directory, see github.skill_rev) plus `firstSeenAt` (the UTC run that first
+#   recorded that rev, from the cross-run rev ledger). `rev` is the only
+#   equality judge; `firstSeenAt` is display-only and never orders anything.
 # v3: index-meta.json slimmed to {formatVersion, generatedAt, counts.total}
 #   and gained `distCommit` (backfilled by CI after the dist force-push);
 #   static schema notes (weeklyInstalls semantics, stars scope) moved to the
@@ -167,7 +183,14 @@ KEEP_FIELDS: set[str] = {"source", "skillId", "installs", "weeklyInstalls"}
 # v2: every record gained a repo-level `stars` field (stargazers_count of the
 #   skill's repository, fetched by the scan step); see index.run_index.
 # v1: initial format.
-INDEX_FORMAT_VERSION = 3
+INDEX_FORMAT_VERSION = 4
+
+# `rev` format: "<REV_ALGO_TAG>-<first REV_DIGEST_HEX hex chars of sha256>".
+# The tag is part of the published value on purpose: switching the digest
+# scheme (domain, normalization, hash) makes old and new fingerprints
+# incomparable, and consumers must be able to see that from the field itself.
+REV_ALGO_TAG = "t1"
+REV_DIGEST_HEX = 16  # 64 bits: collision-free at index scale (~24k skills)
 
 # A GitHub source is `owner/repo` (contains a slash, is not a full URL).
 GITHUB_SOURCE = re.compile(r"^[^/\s]+/[^/\s]+$")

@@ -155,6 +155,10 @@ def test_clean_workspace_wipes_stale_artifacts(
     stale_repo.mkdir(parents=True)
     (stale_repo / "meta.json").write_text(json.dumps({"pushedAt": "x"}))
     (stale_repo / "scanned.jsonl").write_text("{}")
+    # 账本在 cache/ 根：清掉整棵 by-source 也不能碰它，否则所有
+    # firstSeenAt 会被静默重置成"今天"。
+    ledger = tmp_path / "cache" / "rev-ledger.jsonl"
+    ledger.write_text("{}\n")
 
     monkeypatch.setattr(cli, "PUBLISHED_FILES", tuple(published))
     monkeypatch.setattr(cli, "BY_SOURCE_DIR", by_source)
@@ -166,6 +170,7 @@ def test_clean_workspace_wipes_stale_artifacts(
     assert unregistered.exists()
     # The per-repo cache tree is wiped entirely (no stale repo dirs remain).
     assert not by_source.exists()
+    assert ledger.exists()
 
 
 def test_unknown_command_returns_error() -> None:

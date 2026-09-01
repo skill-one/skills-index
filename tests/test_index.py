@@ -51,6 +51,8 @@ def _patch_paths(monkeypatch: pytest.MonkeyPatch, fetched_path: Path, index_path
     monkeypatch.setattr(index_mod, "FETCHED_SKILLS", fetched_path)
     monkeypatch.setattr(index_mod, "INDEX_JSONL", index_path)
     monkeypatch.setattr(index_mod, "INDEX_META_JSON", index_path.parent / "index-meta.json")
+    # run_index 会读写跨运行 rev 账本：不打桩就会污染仓库真实的 cache/。
+    monkeypatch.setattr(index_mod, "REV_LEDGER", index_path.parent / "rev-ledger.jsonl")
 
 
 def test_run_index_merges_scanned_into_fetched(
@@ -301,3 +303,89 @@ def test_run_index_stars_zero_without_meta(
     records, _ = index_mod.run_index(base_dir=by_source)
 
     assert records[0]["stars"] == 0
+
+
+DAY1 = "2026-08-30T00:00:00Z"
+DAY2 = "2026-08-31T00:00:00Z"
+
+
+def _version_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanned: list[dict]
+) -> tuple[Path, Path]:
+    """One repo with `scanned` records; returns (index path, ledger path)."""
+    fetched = [
+        {"source": "owner/repo", "skillId": "a", "installs": 1},
+        {"source": "owner/repo", "skillId": "b", "installs": 2},
+    ]
+    fetched_path, index_path, by_source = _setup_data(
+        tmp_path, fetched=fetched, scanned={"owner__repo": scanned}
+    )
+    _patch_paths(monkeypatch, fetched_path, index_path)
+    return index_path, index_path.parent / "rev-ledger.jsonl"
+
+
+def test_run_index_publishes_rev_and_first_seen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """scan 得到的 rev 原样发布；firstSeenAt 首轮落在本轮时间，并写进账本。"""
+    scanned = [
+        {"path": "skills/a", "rev": "t1-aaa", "description": "A"},
+        {"path": "skills/b", "rev": "t1-bbb", "description": "B"},
+    ]
+    index_path, ledger_path = _version_setup(tmp_path, monkeypatch, scanned)
+
+    records, summary = index_mod.run_index(base_dir=tmp_path / "data" / "by-source", now=DAY1)
+
+    assert [(r["rev"], r["firstSeenAt"]) for r in records] == [
+        ("t1-aaa", DAY1),
+        ("t1-bbb", DAY1),
+    ]
+    assert read_jsonl(index_path) == records
+    assert summary["rev_refreshed"] == 2
+    assert summary["ledger_total"] == 2
+    assert read_jsonl(ledger_path) == [
+        {"source": "owner/repo", "path": "skills/a", "rev": "t1-aaa", "firstSeenAt": DAY1},
+        {"source": "owner/repo", "path": "skills/b", "rev": "t1-bbb", "firstSeenAt": DAY1},
+    ]
+
+
+def test_run_index_date_holds_until_content_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """核心性质：第二天重跑，内容没变的技能日期不动；只有 rev 变了的那条前进。"""
+    scanned = [
+        {"path": "skills/a", "rev": "t1-aaa", "description": "A"},
+        {"path": "skills/b", "rev": "t1-bbb", "description": "B"},
+    ]
+    _index_path, _ledger = _version_setup(tmp_path, monkeypatch, scanned)
+    by_source = tmp_path / "data" / "by-source"
+    index_mod.run_index(base_dir=by_source, now=DAY1)
+
+    second = [
+        {"path": "skills/a", "rev": "t1-aaa", "description": "A"},
+        {"path": "skills/b", "rev": "t1-bbb-edited", "description": "B"},
+    ]
+    write_jsonl(by_source / "owner__repo" / config.SCANNED_FILE, second)
+    records, summary = index_mod.run_index(base_dir=by_source, now=DAY2)
+
+    assert [(r["rev"], r["firstSeenAt"]) for r in records] == [
+        ("t1-aaa", DAY1),
+        ("t1-bbb-edited", DAY2),
+    ]
+    assert summary["rev_refreshed"] == 1
+
+
+def test_run_index_without_rev_yields_no_date(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """旧缓存没有 rev：两个字段都不出现，也不给一个假的日期。"""
+    scanned = [{"path": "skills/a", "description": "A"}]
+    index_path, ledger_path = _version_setup(tmp_path, monkeypatch, scanned)
+
+    records, _summary = index_mod.run_index(
+        base_dir=tmp_path / "data" / "by-source", now=DAY1
+    )
+
+    assert records[0]["skillId"] == "a"
+    assert "rev" not in records[0] and "firstSeenAt" not in records[0]
+    assert not ledger_path.exists() or read_jsonl(ledger_path) == []
