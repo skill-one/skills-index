@@ -2,13 +2,18 @@ name: daily-sync
 
 # Generate the skills index and publish the results as a GitHub Release.
 # Nothing is committed to the main branch (see .gitignore); each run is a
-# self-contained snapshot uploaded as Release assets in two disjoint parts:
-#   - data.tar.gz  published artifacts only (what data consumers download);
-#   - cache.tar.gz per-repo incremental scan state (cache/by-source/), used
-#     solely to restore the next run's pushed_at / skill-sha fingerprints.
-# On main, index.jsonl is additionally force-pushed to the orphan `dist`
-# branch so CDN proxies with CORS headers (jsDelivr and mirrors) can serve it
-# to browsers.
+# self-contained snapshot uploaded as a slim Release asset set:
+#   - index.jsonl / index-meta.json  the primary artifact + its metadata;
+#   - data.tar.gz   the whole published data/ tree (intermediate jsonl such as
+#                   fetched-skills.jsonl / scanned-repos.jsonl live here, not as
+#                   separate assets);
+#   - cache.tar.gz  per-repo incremental scan state (cache/by-source/ + rev
+#                   ledger), used solely to restore the next run's fingerprints;
+#   - run-summary.md the run report (also embedded in the Release body).
+# On main, index.jsonl + index-meta.json are additionally force-pushed to the
+# orphan `dist` branch BEFORE the Release is published (CDN/CORS path), so the
+# distCommit backfill lands in every copy and the Release and dist snapshots are
+# byte-identical.
 #
 # Triggers:
 #   - Daily at 00:00 UTC (full refresh on `main`).
@@ -143,17 +148,56 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: uv run skills-index update ${{ steps.scope.outputs.pages_arg }}
 
-      # Sorted views of scanned-repos.jsonl (stars / skillCount, descending)
-      # are publish-time derivatives: the pipeline writes scan order only, so
-      # the core stays lean. jq's sort is stable, matching the previous Python
-      # sort (ties keep fetch order).
-      - name: Generate sorted repo views
+      # Publish the CDN-accessible snapshot to the orphan `dist` branch FIRST,
+      # before packaging / publishing, so the distCommit backfill written into
+      # the workspace index-meta.json also flows into data.tar.gz and the
+      # Release asset. That is what keeps the Release and dist copies of
+      # index.jsonl / index-meta.json byte-identical: index.jsonl was always
+      # identical, but distCommit can only be recorded once the dist commit
+      # exists, so publishing the branch before the Release closes the gap.
+      #
+      # Single-snapshot orphan branch (force-pushed, no history accumulation):
+      # makes index.jsonl addressable as a normal git file so CORS-enabled CDN
+      # proxies (cdn.jsdelivr.net / cdn.jsdmirror.com /gh/...@dist/...) can
+      # serve it — release assets are not proxyable. index-meta.json rides
+      # along so CDN consumers can read generatedAt / formatVersion /
+      # distCommit. Main only, so smoke runs on `test` never overwrite the
+      # published index (and, with no dist commit to point at, their meta
+      # simply omits distCommit).
+      - name: Publish index.jsonl to dist branch (CDN-accessible)
+        if: github.ref_name == 'main'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          jq -sc 'sort_by(-(.stars // 0))[]' data/github/scanned-repos.jsonl \
-            > data/github/scanned-repos-by-stars.jsonl
-          jq -sc 'sort_by(-(.skillCount // 0))[]' data/github/scanned-repos.jsonl \
-            > data/github/scanned-repos-by-skillcount.jsonl
+          rm -rf "$RUNNER_TEMP/dist" && mkdir -p "$RUNNER_TEMP/dist" && cd "$RUNNER_TEMP/dist"
+          git init -b dist
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The dist branch keeps a flat layout so CDN URLs stay stable
+          # (.../gh/<repo>@dist/index.jsonl) regardless of the data/ tree.
+          cp "$GITHUB_WORKSPACE/data/index/index.jsonl" .
+          cp "$GITHUB_WORKSPACE/data/index/index-meta.json" .
+          git add index.jsonl index-meta.json
+          git commit -m "index snapshot ${{ steps.scope.outputs.ts }}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin dist
+          # Backfill distCommit: the dist commit carrying this snapshot's
+          # index.jsonl only exists after the push, and consumers use it to
+          # fetch the jsonl from an immutable, commit-addressed URL
+          # (.../gh/<repo>@<sha>/index.jsonl) instead of the mutable `dist`
+          # ref. index.jsonl bytes are identical in both commits, so the
+          # recorded snapshot stays immutable. The backfilled meta is pushed
+          # as a second commit and, because this step runs before packaging /
+          # publishing, also lands in data.tar.gz and the Release asset via the
+          # workspace copy — so all three index-meta.json copies match.
+          dist_commit=$(git rev-parse HEAD)
+          jq --arg c "$dist_commit" '.distCommit = $c' index-meta.json > "$RUNNER_TEMP/meta.tmp"
+          cp "$RUNNER_TEMP/meta.tmp" "$GITHUB_WORKSPACE/data/index/index-meta.json"
+          cp "$RUNNER_TEMP/meta.tmp" index-meta.json
+          git add index-meta.json
+          git commit -m "meta: backfill distCommit"
+          git push --force origin dist
 
       - name: Package data snapshot
         run: |
@@ -188,60 +232,21 @@ jobs:
             Generated at ${{ steps.scope.outputs.ts }} (UTC).
 
             ${{ steps.report.outputs.body }}
-          # Asset names are flat basenames (data/ and cache/ prefixes are
-          # stripped), so the in-repo directory layout below does not change
-          # download URLs: releases/download/<tag>/index.jsonl stays stable.
+          # Slim, human-facing asset set. Names are flat basenames (data/ and
+          # cache/ prefixes stripped), so releases/download/<tag>/<file> URLs
+          # stay stable regardless of the in-repo layout:
+          #   - index.jsonl + index-meta.json: the primary artifact and its
+          #     metadata, byte-identical to the `dist` branch copy;
+          #   - data.tar.gz: the whole published data/ tree (fetched-skills.jsonl
+          #     and github/scanned-repos.jsonl live here, no longer flattened);
+          #   - cache.tar.gz: incremental state for the next run only;
+          #   - run-summary.md: this report.
           files: |
             data.tar.gz
             cache.tar.gz
             data/index/index.jsonl
             data/index/index-meta.json
-            data/skills-sh/fetched-skills.jsonl
-            data/github/scanned-repos.jsonl
-            data/github/scanned-repos-by-stars.jsonl
-            data/github/scanned-repos-by-skillcount.jsonl
             data/run-summary.md
-
-      # Single-snapshot orphan branch (force-pushed, no history accumulation):
-      # makes index.jsonl addressable as a normal git file so CORS-enabled CDN
-      # proxies (cdn.jsdelivr.net / cdn.jsdmirror.com /gh/...@dist/...) can
-      # serve it — release assets are not proxyable. index-meta.json rides
-      # along so CDN consumers can read generatedAt / formatVersion /
-      # distCommit. Main only, so smoke runs on `test` never overwrite the
-      # published index.
-      - name: Publish index.jsonl to dist branch (CDN-accessible)
-        if: github.ref_name == 'main'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          rm -rf "$RUNNER_TEMP/dist" && mkdir -p "$RUNNER_TEMP/dist" && cd "$RUNNER_TEMP/dist"
-          git init -b dist
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # The dist branch keeps a flat layout so CDN URLs stay stable
-          # (.../gh/<repo>@dist/index.jsonl) regardless of the data/ tree.
-          cp "$GITHUB_WORKSPACE/data/index/index.jsonl" .
-          cp "$GITHUB_WORKSPACE/data/index/index-meta.json" .
-          git add index.jsonl index-meta.json
-          git commit -m "index snapshot ${{ steps.scope.outputs.ts }}"
-          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push --force origin dist
-          # Backfill distCommit: the dist commit carrying this snapshot's
-          # index.jsonl only exists after the push, and consumers use it to
-          # fetch the jsonl from an immutable, commit-addressed URL
-          # (.../gh/<repo>@<sha>/index.jsonl) instead of the mutable `dist`
-          # ref. index.jsonl bytes are identical in both commits, so the
-          # recorded snapshot stays immutable. The backfilled meta is pushed
-          # as a second commit and also lands in the Release assets /
-          # data.tar.gz via the workspace copy.
-          dist_commit=$(git rev-parse HEAD)
-          jq --arg c "$dist_commit" '.distCommit = $c' index-meta.json > "$RUNNER_TEMP/meta.tmp"
-          cp "$RUNNER_TEMP/meta.tmp" "$GITHUB_WORKSPACE/data/index/index-meta.json"
-          cp "$RUNNER_TEMP/meta.tmp" index-meta.json
-          git add index-meta.json
-          git commit -m "meta: backfill distCommit"
-          git push --force origin dist
 
       # Prune only on main, so test smoke runs don't consume the retention quota.
       - name: Prune old releases

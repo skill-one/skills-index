@@ -13,7 +13,7 @@ from skills_index import cli
 def test_parser_has_all_subcommands() -> None:
     parser = cli.build_parser()
     # Each known command parses and tags args.command (no private internals).
-    for command in ("fetch", "scan", "index", "update"):
+    for command in ("fetch", "scan", "index", "update", "pull"):
         args = parser.parse_args([command])
         assert args.command == command
 
@@ -47,6 +47,29 @@ def test_cli_forwards_args_to_fetch_scan_index(
     assert seen["fetch"] == {"max_pages": 3}
     assert seen["scan"] == {"force": True, "max_skill_count": 7}
     assert seen["index"] == {"called": True}
+
+
+def test_cli_pull_forwards_repo_and_dest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`pull` dispatches to run_pull with --repo / --dest forwarded."""
+    seen: dict[str, object] = {}
+
+    def fake_pull(repo: str, *, dest_root: Path, **kw: object) -> dict:
+        seen["repo"] = repo
+        seen["dest_root"] = dest_root
+        return {}
+
+    monkeypatch.setattr(cli, "run_pull", fake_pull)
+
+    assert cli.main(["pull"]) == 0
+    assert seen["repo"] == cli.GITHUB_REPO
+    assert seen["dest_root"] == cli.PULLED_DIR
+
+    dest = tmp_path / "out"
+    assert cli.main(["pull", "--repo", "foo/bar", "--dest", str(dest)]) == 0
+    assert seen["repo"] == "foo/bar"
+    assert seen["dest_root"] == dest
 
 
 def test_update_runs_pipeline_in_order(
@@ -141,8 +164,6 @@ def test_clean_workspace_wipes_stale_artifacts(
         data / "index.jsonl",
         data / "index-meta.json",
         data / "scanned-repos.jsonl",
-        data / "scanned-repos-by-stars.jsonl",
-        data / "scanned-repos-by-skillcount.jsonl",
         data / "run-summary.md",
     ]
     for path in published:

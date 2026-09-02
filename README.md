@@ -58,17 +58,13 @@ What the fingerprint deliberately does not cover: files **outside** the skill di
 
 Each Release contains:
 
-| File                                | Description                                                                                                              |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `index.jsonl`                       | The merged final index (flattened per **skill**; **recommended for direct consumption**)                                  |
-| `index-meta.json`                   | Self-describing index metadata: `formatVersion` (bumped when fields change), `generatedAt` (generation time), `counts.total`, and `distCommit` (the `dist`-branch commit carrying this snapshot's `index.jsonl`, backfilled by CI — see [CDN access](#access-via-cdn-directly-usable-in-browsers)) |
-| `data.tar.gz`                       | Full data snapshot (internally organized into the `skills-sh/` / `github/` / `index/` directories; published data only, no pipeline-internal state) |
-| `cache.tar.gz`                      | Incremental state: per-repo fingerprints under `cache/by-source/` plus the rev ledger `cache/rev-ledger.jsonl` (which lets `firstSeenAt` stay put while a skill's content is unchanged). Used only by the next CI run; data consumers don't need to download it |
-| `fetched-skills.jsonl`              | Summarized raw skills.sh data (intermediate artifact)                                                                     |
-| `scanned-repos.jsonl`               | Per-repository scan results in **original scan order** (the order fetch pulled them in, unsorted)                         |
-| `scanned-repos-by-stars.jsonl`      | Scan results sorted by **star count, descending**                                                                         |
-| `scanned-repos-by-skillcount.jsonl` | Scan results sorted by **installed skills count (`skillCount`), descending**                                              |
-| `run-summary.md`                    | Run report (per-stage counts and timings)                                                                                 |
+| File                  | Description                                                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `index.jsonl`         | The merged final index (flattened per **skill**; **recommended for direct consumption**)                                  |
+| `index-meta.json`     | Self-describing index metadata: `formatVersion` (bumped when fields change), `generatedAt` (generation time), `counts.total`, and `distCommit` (the `dist`-branch commit carrying this snapshot's `index.jsonl`, backfilled by CI — see [CDN access](#access-via-cdn-directly-usable-in-browsers)) |
+| `data.tar.gz`         | Full data snapshot (the `skills-sh/` / `github/` / `index/` directories; published data only, no pipeline-internal state). Also carries the intermediate `fetched-skills.jsonl` and `scanned-repos.jsonl`, which are no longer published as separate assets |
+| `cache.tar.gz`        | Incremental state: per-repo fingerprints under `cache/by-source/` plus the rev ledger `cache/rev-ledger.jsonl` (which lets `firstSeenAt` stay put while a skill's content is unchanged). Used only by the next CI run; data consumers don't need to download it |
+| `run-summary.md`      | Run report (per-stage counts and timings)                                                                                 |
 
 ## How to fetch and use it
 

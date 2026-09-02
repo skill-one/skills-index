@@ -6,16 +6,20 @@ import argparse
 import shutil
 import sys
 import time
+from pathlib import Path
 
 from .config import (
     BY_SOURCE_DIR,
+    GITHUB_REPO,
     JSON,
     MAX_SKILL_COUNT,
     PUBLISHED_FILES,
+    PULLED_DIR,
     RUN_SUMMARY,
 )
 from .fetch import prune_stale_repos, run_fetch
 from .index import run_index
+from .pull import run_pull
 from .scan import scan_repositories
 
 
@@ -63,6 +67,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="skip repos with more than this many skills "
              f"(default: config.MAX_SKILL_COUNT={MAX_SKILL_COUNT})",
+    )
+
+    pull_p = sub.add_parser(
+        "pull",
+        help="download the latest published data snapshot for local inspection "
+             "(standalone; does not touch data/ or cache/)",
+    )
+    pull_p.add_argument(
+        "--repo",
+        default=GITHUB_REPO,
+        help=f"owner/repo or a GitHub URL to pull from (default: {GITHUB_REPO})",
+    )
+    pull_p.add_argument(
+        "--dest",
+        type=Path,
+        default=PULLED_DIR,
+        help=f"local root for pulled snapshots (default: {PULLED_DIR.name}/)",
     )
 
     return p
@@ -158,18 +179,18 @@ def _build_summary(
         f"(ledger rows: `{index_sum.get('ledger_total', 0)}`)",
         "",
         "### Artifacts",
-        "- `data.tar.gz` — published `data/` tree (no pipeline-internal state)",
+        "- `data.tar.gz` — published `data/` tree (skills-sh / github / index; "
+        "no pipeline-internal state)",
         "- `cache.tar.gz` — incremental state restored by the next CI run: the "
         "per-repo scan cache (`cache/by-source/`) plus the rev ledger "
         "(`cache/rev-ledger.jsonl`)",
-        "- `index.jsonl` — merged skills index",
-        "- `index-meta.json` — index metadata (generatedAt / counts / format version)",
-        "- `fetched-skills.jsonl` — raw skills.sh data",
-        "- `scanned-repos.jsonl` — per-repo scan summary (scan order)",
-        "- `scanned-repos-by-stars.jsonl` — same rows, sorted by stars "
-        "(generated at publish time)",
-        "- `scanned-repos-by-skillcount.jsonl` — same rows, sorted by skillCount "
-        "(generated at publish time)",
+        "- `index.jsonl` — merged skills index (also mirrored to the `dist` "
+        "branch for CDN access)",
+        "- `index-meta.json` — index metadata (generatedAt / counts / format "
+        "version / distCommit)",
+        "- `run-summary.md` — this report",
+        "- inside `data.tar.gz`: `fetched-skills.jsonl` (raw skills.sh data) "
+        "and `github/scanned-repos.jsonl` (per-repo scan summary, scan order)",
     ]
     return "\n".join(lines) + "\n"
 
@@ -214,6 +235,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "index":
         run_index()
+        return 0
+
+    if args.command == "pull":
+        run_pull(args.repo, dest_root=args.dest)
         return 0
 
     if args.command == "update":

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -132,3 +135,60 @@ def get_json(client: httpx.Client, url: str) -> Any:
 def new_github_client(token: str | None = None) -> httpx.Client:
     """Convenience: a GitHub-authenticated client."""
     return build_client(token or load_github_token(), base_url=GITHUB_API)
+
+
+def download_file(url: str, dest: Path, *, client: httpx.Client | None = None) -> int:
+    """Stream `url` to `dest` (binary), retrying transient errors with backoff.
+
+    Used to fetch a Release asset's ``browser_download_url``, which lives on an
+    object host served anonymously and is NOT part of the REST API quota. A
+    plain client is built when none is passed so no ``Authorization`` header is
+    ever forwarded to that host. The body is written to a temp file alongside
+    ``dest`` and ``os.replace``-d into place only on success, so an interrupted
+    download never leaves a half-written artifact. Returns bytes written.
+    """
+    own_client = client is None
+    c = client or httpx.Client(
+        headers={"User-Agent": USER_AGENT},
+        timeout=TIMEOUT,
+        follow_redirects=True,
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    last_err: Exception | None = None
+    try:
+        for attempt in range(1, RETRIES + 1):
+            tmp_fd, tmp_name = tempfile.mkstemp(dir=dest.parent, prefix=".part-")
+            try:
+                with c.stream("GET", url) as resp:
+                    if resp.status_code >= 400:
+                        if resp.status_code in (404, 451):
+                            raise HttpError(
+                                f"{resp.status_code} on {url}", status=resp.status_code
+                            )
+                        resp.raise_for_status()
+                    with os.fdopen(tmp_fd, "wb") as out:
+                        for chunk in resp.iter_bytes():
+                            out.write(chunk)
+                os.replace(tmp_name, dest)
+                return dest.stat().st_size
+            except (httpx.HTTPError, OSError) as exc:
+                status = (
+                    exc.response.status_code
+                    if isinstance(exc, httpx.HTTPStatusError)
+                    else None
+                )
+                if status in (404, 451):
+                    raise HttpError(f"{status} on {url}", status=status) from exc
+                last_err = exc
+                wait = 2.0 * attempt
+                print(
+                    f"  [retry {attempt}/{RETRIES}] {url}: {exc}; sleeping {wait:.1f}s"
+                )
+                time.sleep(wait)
+            finally:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+    finally:
+        if own_client:
+            c.close()
+    raise HttpError(f"download failed after {RETRIES} retries: {url}") from last_err

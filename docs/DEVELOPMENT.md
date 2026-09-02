@@ -47,6 +47,25 @@ A three-step pipeline (`update` chains them into one command):
 | `skills-index scan` | Incremental repo scan | `--force` full rescan; `--max-skill-count N` filter cap (default 500, 0 disables) |
 | `skills-index index` | Merge into the final index | none |
 | `skills-index update` | Run the whole pipeline in one step | `--pages N`; `--force` full rebuild; `--max-skill-count N` |
+| `skills-index pull` | **Standalone helper** (not part of the pipeline): download the latest published `data-` release's `data.tar.gz` snapshot into `pulled/<tag>/` and print an inspection report — never touches `data/` or `cache/` | `--repo owner/repo` or GitHub URL (default `skill-one/skills-index`); `--dest` output root (default `pulled/`) |
+
+## Inspecting a published snapshot locally (`pull`)
+
+`pull` is a **fully standalone helper**, orthogonal to the `fetch → scan → index → update` pipeline: it never reads or writes `data/` or `cache/`, never feeds the incremental chain, and adds no third-party dependency (it reuses the `http` / `config` / `io_utils` layers only). It exists so a person can grab exactly what CI published and eyeball it locally before pointing a tool at it.
+
+What it does:
+
+1. Resolves the repo's **latest `data-` GitHub Release**. CI marks smoke (`alpha-`) releases as prerelease, so `releases/latest` always means the newest full snapshot.
+2. Downloads the bundled `data.tar.gz` asset via its public `browser_download_url` (served anonymously by an object host — no auth needed for this public repo; the download is not billed to the REST quota).
+3. **Safely** extracts it into `pulled/<tag>/data/`, mirroring the published layout. Any pre-existing same-tag directory is wiped first, so a re-pull is always a faithful, complete copy. Path-traversal (`../`, absolute) members and non-regular entries (symlinks / devices) are rejected before any byte is written. The archive is removed after extraction.
+4. Prints an inspection report: `index-meta.json` (`formatVersion` / `generatedAt` / `counts.total`), the **actual** `index.jsonl` line count (with a `⚠` when it disagrees with `counts.total`), and every file under `data/` with its size.
+
+The `pulled/` tree is git-ignored.
+
+```bash
+uv run skills-index pull                    # latest snapshot of this repo -> pulled/<tag>/
+uv run skills-index pull --repo owner/repo  # any GitHub repo's latest data- release
+```
 
 ## Data layout
 
@@ -71,7 +90,6 @@ cache/                                 # incremental cache (cache.tar.gz, for th
 
 > Release asset names are flat basenames, so the directory layering above does not affect the `releases/download/<tag>/<filename>` download URLs; inside `data.tar.gz` / `cache.tar.gz`, the contents follow these two tree layouts respectively.
 
-- The two sorted views `scanned-repos-by-stars.jsonl` / `scanned-repos-by-skillcount.jsonl` are generated **by CI at publish time** from `scanned-repos.jsonl` (see daily.yml); the core pipeline produces only the single scan-order copy.
 - `cache/by-source/<owner>__<repo>/meta.json` is a single shape tagged by `status` (see `src/skills_index/cache.py`):
   - `ok` — a normal cache: `branch` / `pushedAt` / `stars` / `skillCount` / `skillTreeShas` (the `{path: git tree sha}` baseline of the repo's public skill directories, compared against the Trees API on the next run; it may be empty when that request failed, which only costs one redundant tarball download);
   - `filtered` — excluded for exceeding the skillCount cap: keeps `pushedAt` + `skillCount`; later runs skip it without a tarball until the repo receives a new push and is re-adjudicated;
@@ -86,19 +104,20 @@ cache/                                 # incremental cache (cache.tar.gz, for th
 ```
 src/skills_index/
 ├── __init__.py   # package version
-├── cli.py        # argparse entry: fetch / scan / index / update orchestration + run report
+├── cli.py        # argparse entry: fetch / scan / index / update / pull orchestration + run report
 ├── config.py     # constants, paths (data/ and cache/ registries), filter rules, token discovery, source<->dir mapping (leaf module)
-├── http.py       # thin httpx wrapper: client, retries, GitHub auth, rate-limit backoff
+├── http.py       # thin httpx wrapper: client, retries, GitHub auth, rate-limit backoff, binary download
 ├── io_utils.py   # JSON / JSONL read-write helpers
 ├── cache.py      # cross-run state: RepoCache (per-repo fingerprints) + RevLedger (rev -> firstSeenAt)
 ├── github.py     # GitHub interface: repo metadata, Trees precheck, codeload tarball parsing, skill_rev
 ├── fetch.py      # pull skills.sh -> filter -> distribute by source; includes prune_stale_repos
 ├── scan.py       # incremental scan (pushed_at / Trees precheck / fingerprints) + aggregation + mirror dedup
-└── index.py      # merge fetched + scanned, stamp rev/firstSeenAt, generate data/index.jsonl
+├── index.py      # merge fetched + scanned, stamp rev/firstSeenAt, generate data/index.jsonl
+└── pull.py       # standalone: download + inspect the latest published data- release snapshot (no pipeline coupling)
 ```
 
-Dependencies are acyclic: `config` is the leaf, depended on by all other modules; `http` depends only on `config`; `cache` depends on `config` / `io_utils`; `github` / `fetch` depend on `http` / `config` / `io_utils`; `scan` and `index` additionally depend on `cache` (fingerprints / rev ledger); `cli` only orchestrates and implements no business logic.
+Dependencies are acyclic: `config` is the leaf, depended on by all other modules; `http` depends only on `config`; `cache` depends on `config` / `io_utils`; `github` / `fetch` depend on `http` / `config` / `io_utils`; `scan` and `index` additionally depend on `cache` (fingerprints / rev ledger); `pull` reuses only `http` / `config` / `io_utils`, adds no new dependency, and is imported by nothing in the pipeline (it stands alone); `cli` only orchestrates and implements no business logic.
 
 ## CI
 
-Data is generated and published as a Release automatically every day at 00:00 UTC by GitHub Actions (`.github/workflows/daily.yml`): every run (including smoke) first passes a **lint + test gate** (ruff / mypy / pytest + coverage, on a Python 3.11 and 3.13 matrix); once through, `main` runs a full fetch and the `test` branch pulls 1 page as a smoke run (smoke releases are marked prerelease and never occupy `releases/latest`); before a full run, the incremental state (`cache/by-source/` fingerprints and the root-level rev ledger) is restored from the previous `data-` release (downloading its `cache.tar.gz`); at publish time `data/` (`data.tar.gz`, pure published data) and `cache/` (`cache.tar.gz`, incremental cache) are packaged separately; the two sorted views of `scanned-repos` are generated by CI at the publish stage; `index.jsonl` and `index-meta.json` are additionally force-pushed to the `dist` branch for access via jsDelivr and other CDNs — the push happens in two commits so CI can backfill `distCommit` (the first commit's sha, whose `index.jsonl` bytes are identical) into the metadata, giving consumers an immutable, commit-addressed URL for the body; the most recent 10 Releases are retained.
+Data is generated and published as a Release automatically every day at 00:00 UTC by GitHub Actions (`.github/workflows/daily.yml`): every run (including smoke) first passes a **lint + test gate** (ruff / mypy / pytest + coverage, on a Python 3.11 and 3.13 matrix); once through, `main` runs a full fetch and the `test` branch pulls 1 page as a smoke run (smoke releases are marked prerelease and never occupy `releases/latest`); before a full run, the incremental state (`cache/by-source/` fingerprints and the root-level rev ledger) is restored from the previous `data-` release (downloading its `cache.tar.gz`). On `main`, `index.jsonl` and `index-meta.json` are force-pushed to the orphan `dist` branch **before** packaging and publishing: the push happens in two commits so CI can backfill `distCommit` (the first commit's sha, whose `index.jsonl` bytes are identical) into the metadata — and because this runs before packaging, the backfilled meta also flows into `data.tar.gz` and the Release asset, so the Release and `dist` copies of `index.jsonl` / `index-meta.json` are byte-identical and consumers get an immutable, commit-addressed URL. Smoke (`test` branch) runs skip the dist push, so their meta simply omits `distCommit`. `data/` and `cache/` are packaged separately (`data.tar.gz`, `cache.tar.gz`). The Release carries a **slim set of 5 assets** — `index.jsonl`, `index-meta.json`, `data.tar.gz`, `cache.tar.gz`, `run-summary.md` — while the intermediate jsonl (`fetched-skills.jsonl`, `scanned-repos.jsonl`) ship only inside `data.tar.gz`, not as separate assets; the most recent 10 Releases are retained.

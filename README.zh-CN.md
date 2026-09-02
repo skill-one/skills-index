@@ -58,17 +58,13 @@
 
 每个 Release 包含：
 
-| 文件                                | 说明                                                                                                                     |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `index.jsonl`                       | 合并后的最终索引（以**技能**为单位平铺，**推荐直接消费这个**）                                                           |
-| `index-meta.json`                   | 索引自描述元数据：`formatVersion`（字段变更时递增）、`generatedAt`（生成时间）、`counts.total`，以及 `distCommit`（承载本快照 `index.jsonl` 的 `dist` 分支 commit，由 CI 回填——见 [通过 CDN 访问](#通过-cdn-访问浏览器可直接用)） |
-| `data.tar.gz`                       | 完整数据快照（内部按 `skills-sh/` / `github/` / `index/` 分目录，仅含发布数据，不含流水线内部状态）                    |
-| `cache.tar.gz`                      | 增量状态：`cache/by-source/` 下的 per-repo 指纹 + rev 账本 `cache/rev-ledger.jsonl`（让 `firstSeenAt` 在内容未变时保持稳定）。仅供下一轮 CI 恢复；数据消费者无需下载 |
-| `fetched-skills.jsonl`              | skills.sh 原始数据汇总（中间产物）                                                                                       |
-| `scanned-repos.jsonl`               | 按仓库汇总的扫描结果，**原始扫描顺序**（fetch 拉取到的顺序，未排序）                                                     |
-| `scanned-repos-by-stars.jsonl`      | 按 **star 数降序**排列的扫描结果                                                                                         |
-| `scanned-repos-by-skillcount.jsonl` | 按**安装 skills 技能数（`skillCount`）降序**排列的扫描结果                                                               |
-| `run-summary.md`                    | 本次运行报告（各阶段计数与耗时）                                                                                         |
+| 文件                  | 说明                                                                                                                     |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `index.jsonl`         | 合并后的最终索引（以**技能**为单位平铺，**推荐直接消费这个**）                                                           |
+| `index-meta.json`     | 索引自描述元数据：`formatVersion`（字段变更时递增）、`generatedAt`（生成时间）、`counts.total`，以及 `distCommit`（承载本快照 `index.jsonl` 的 `dist` 分支 commit，由 CI 回填——见 [通过 CDN 访问](#通过-cdn-访问浏览器可直接用)） |
+| `data.tar.gz`         | 完整数据快照（内部按 `skills-sh/` / `github/` / `index/` 分目录，仅含发布数据，不含流水线内部状态）。同时携带中间产物 `fetched-skills.jsonl` 与 `scanned-repos.jsonl`——它们不再作为独立资产单独发布 |
+| `cache.tar.gz`        | 增量状态：`cache/by-source/` 下的 per-repo 指纹 + rev 账本 `cache/rev-ledger.jsonl`（让 `firstSeenAt` 在内容未变时保持稳定）。仅供下一轮 CI 恢复；数据消费者无需下载 |
+| `run-summary.md`      | 本次运行报告（各阶段计数与耗时）                                                                                         |
 
 ## 如何获取与使用
 
