@@ -19,12 +19,16 @@ from skills_index.github import (
 from skills_index.io_utils import read_jsonl, write_jsonl
 from skills_index.scan import build_skill_records
 
-# Published rev shape: algorithm tag + truncated sha256 (see config.REV_*).
-REV_RE = re.compile(r"^t1-[0-9a-f]{16}$")
+# Published rev shape: a bare truncated sha256, no algorithm tag (config.REV_*).
+REV_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
 def _make_tarball(files: dict[str, bytes]) -> bytes:
-    """Build an in-memory gzipped tarball with a top-level `repo-<sha>/` dir."""
+    """Build an in-memory gzipped tarball with a top-level `repo-<ref>/` dir.
+
+    GitHub names archive roots after the requested ref (`skills-main/`), which
+    the parser strips as the single leading path component.
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for name, data in files.items():
@@ -337,20 +341,20 @@ def test_extract_description_missing_returns_empty() -> None:
 
 
 def test_build_skill_records_sorts_by_path_and_parses_locally() -> None:
-    revs = {"skills/b": "t1-b", "skills/a": "t1-a"}
+    revs = {"skills/b": "b", "skills/a": "a"}
     contents = {
         "skills/a": "---\ndescription: A\n---\n",
         "skills/b": "---\ndescription: B\n---\n",
     }
     assert build_skill_records(revs, contents) == [
-        {"path": "skills/a", "rev": "t1-a", "description": "A"},
-        {"path": "skills/b", "rev": "t1-b", "description": "B"},
+        {"path": "skills/a", "rev": "a", "description": "A"},
+        {"path": "skills/b", "rev": "b", "description": "B"},
     ]
 
 
 def test_build_skill_records_missing_content_yields_empty_description() -> None:
-    assert build_skill_records({"skills/a": "t1-a"}, {}) == [
-        {"path": "skills/a", "rev": "t1-a", "description": ""}
+    assert build_skill_records({"skills/a": "a"}, {}) == [
+        {"path": "skills/a", "rev": "a", "description": ""}
     ]
 
 

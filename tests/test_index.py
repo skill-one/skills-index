@@ -329,23 +329,23 @@ def test_run_index_publishes_rev_and_first_seen(
 ) -> None:
     """scan 得到的 rev 原样发布；firstSeenAt 首轮落在本轮时间，并写进账本。"""
     scanned = [
-        {"path": "skills/a", "rev": "t1-aaa", "description": "A"},
-        {"path": "skills/b", "rev": "t1-bbb", "description": "B"},
+        {"path": "skills/a", "rev": "aaa", "description": "A"},
+        {"path": "skills/b", "rev": "bbb", "description": "B"},
     ]
     index_path, ledger_path = _version_setup(tmp_path, monkeypatch, scanned)
 
     records, summary = index_mod.run_index(base_dir=tmp_path / "data" / "by-source", now=DAY1)
 
     assert [(r["rev"], r["firstSeenAt"]) for r in records] == [
-        ("t1-aaa", DAY1),
-        ("t1-bbb", DAY1),
+        ("aaa", DAY1),
+        ("bbb", DAY1),
     ]
     assert read_jsonl(index_path) == records
     assert summary["rev_refreshed"] == 2
     assert summary["ledger_total"] == 2
     assert read_jsonl(ledger_path) == [
-        {"source": "owner/repo", "path": "skills/a", "rev": "t1-aaa", "firstSeenAt": DAY1},
-        {"source": "owner/repo", "path": "skills/b", "rev": "t1-bbb", "firstSeenAt": DAY1},
+        {"source": "owner/repo", "path": "skills/a", "rev": "aaa", "firstSeenAt": DAY1},
+        {"source": "owner/repo", "path": "skills/b", "rev": "bbb", "firstSeenAt": DAY1},
     ]
 
 
@@ -354,23 +354,23 @@ def test_run_index_date_holds_until_content_changes(
 ) -> None:
     """核心性质：第二天重跑，内容没变的技能日期不动；只有 rev 变了的那条前进。"""
     scanned = [
-        {"path": "skills/a", "rev": "t1-aaa", "description": "A"},
-        {"path": "skills/b", "rev": "t1-bbb", "description": "B"},
+        {"path": "skills/a", "rev": "aaa", "description": "A"},
+        {"path": "skills/b", "rev": "bbb", "description": "B"},
     ]
     _index_path, _ledger = _version_setup(tmp_path, monkeypatch, scanned)
     by_source = tmp_path / "data" / "by-source"
     index_mod.run_index(base_dir=by_source, now=DAY1)
 
     second = [
-        {"path": "skills/a", "rev": "t1-aaa", "description": "A"},
-        {"path": "skills/b", "rev": "t1-bbb-edited", "description": "B"},
+        {"path": "skills/a", "rev": "aaa", "description": "A"},
+        {"path": "skills/b", "rev": "bbb-edited", "description": "B"},
     ]
     write_jsonl(by_source / "owner__repo" / config.SCANNED_FILE, second)
     records, summary = index_mod.run_index(base_dir=by_source, now=DAY2)
 
     assert [(r["rev"], r["firstSeenAt"]) for r in records] == [
-        ("t1-aaa", DAY1),
-        ("t1-bbb-edited", DAY2),
+        ("aaa", DAY1),
+        ("bbb-edited", DAY2),
     ]
     assert summary["rev_refreshed"] == 1
 

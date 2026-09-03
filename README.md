@@ -23,7 +23,7 @@ The final index `index.jsonl` is **flattened per skill**, one skill per line:
   ],
   "path": "skills/find-skills",
   "description": "Discover and install agent skills",
-  "rev": "t1-8f3ac21d9b0c4e5f",
+  "rev": "8f3ac21d9b0c4e5f",
   "firstSeenAt": "2026-08-24T14:20:17Z"
 }
 ```
@@ -37,7 +37,7 @@ The final index `index.jsonl` is **flattened per skill**, one skill per line:
 | `weeklyInstalls`  | Weekly installs over the last 8 weeks (from skills.sh, chronological)  |
 | `path`            | Skill's path relative to the repository root (e.g. `skills/find-skills`) |
 | `description`     | Skill description (from the `SKILL.md` frontmatter)                    |
-| `rev`             | Content fingerprint of the skill **directory**: `t1-` plus a truncated sha256 over every file's (path, git mode, blob sha). Changes exactly when the skill's content does |
+| `rev`             | Content fingerprint of the skill **directory**: the first 16 hex chars of a sha256 over every file's (path, git mode, blob sha). Changes exactly when the skill's content does. Opaque to consumers — compare it for equality only; it carries no ordering and no version scheme |
 | `firstSeenAt`     | UTC timestamp of the index run that first recorded this `rev` — i.e. when this version appeared in the index |
 
 ### Versions and updates
@@ -45,6 +45,8 @@ The final index `index.jsonl` is **flattened per skill**, one skill per line:
 `rev` is the **only** field that decides whether an installed skill is current: record it when you install, compare for **equality** on every refresh. It is a digest, not a version number — two revs have no ordering, so never write `remote > local`, and never invent a `v1/v2/v3` counter of your own (a rollback would break it). Equality also means noise is impossible: commit times, authors, README edits and pushes that touch other skills of the same repository all leave `rev` untouched.
 
 `firstSeenAt` is for humans: a readable "updated 3 days ago" and a sort key for lists of pending updates. It advances only together with `rev`, which is what makes it safe to display as a version date. Show `rev` itself only where users need to name an exact build (a detail row, `8f3ac21d9b0c4e5f` in a tooltip, or `8f3ac21 → b7d1f04` in an update prompt); that value is also what a "skip this version" choice should store.
+
+One migration note: before `formatVersion` 5 every `rev` carried a `t1-` algorithm prefix. If you stored a rev from an older index, your first comparison after upgrading mismatches for every skill — that is a re-fingerprint, not new content, so re-record the rev without surfacing an update.
 
 What the fingerprint deliberately does not cover: files **outside** the skill directory (a shared `../lib`, a repository-level `AGENTS.md`) and upstream content the archive does not contain. Author-declared `version:` frontmatter is not published either — roughly one skill in ten declares it, and it is not maintained, so it cannot be a change detector; use the commit history link if you want to read what changed:
 `https://github.com/<source>/commits/HEAD/<path>`.

@@ -14,7 +14,7 @@ import tarfile
 
 from skills_index.github import get_skill_contents, get_skill_tree_shas
 
-REV_RE = re.compile(r"^t1-[0-9a-f]{16}$")
+REV_RE = re.compile(r"^[0-9a-f]{16}$")
 
 _SKILL = b"---\nname: foo\ndescription: Foo\n---\n"
 
@@ -119,6 +119,24 @@ def test_rev_follows_the_exec_bit() -> None:
     assert plain != execable
     # git 只记录可执行位，其余权限位不影响内容。
     assert _scan(files, modes={"skills/foo/run.sh": 0o600})[0]["skills/foo"] == plain
+
+
+def test_rev_is_pinned_to_a_golden_digest() -> None:
+    """算法冻结契约的执法者：固定输入 → 固定摘要。
+
+    `rev` 发布为裸摘要，值里不带算法标识，所以指纹域、规范化（排序 +
+    `json.dumps`）、哈希或截断长度一旦变动，全部发布值都会被静默改写，事后
+    无人能从数据分辨。这条测试让这种变动在 CI 上失败。改期望值必须与
+    `config.SCHEMA_VERSION`（全量重建）和 `INDEX_FORMAT_VERSION` 的 bump 同轮
+    发生，见 config 中 REV_DIGEST_HEX 的格式契约。
+    """
+    files = {
+        "skills/foo/SKILL.md": _SKILL,
+        "skills/foo/scripts/run.sh": b"echo hello\n",
+        "skills/foo/notes.txt": b"plain\n",
+    }
+    rev = _scan(files, modes={"skills/foo/scripts/run.sh": 0o755})[0]["skills/foo"]
+    assert rev == "0edc330a08c24472"
 
 
 def test_nested_skill_md_counts_as_payload_of_the_outer_unit() -> None:

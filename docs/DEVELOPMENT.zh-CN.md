@@ -34,7 +34,7 @@ uv run pytest
 | 4. update | `skills-index update` | 1→3 一步完成（本地测试与 CI 统一入口） | 以上全部 |
 
 - **增量机制**：`scan` 先按 `pushed_at` 跳过未变更仓库；有推送的仓库再用一次 Trees API 比对**每个公开技能目录的 git tree sha** 与缓存基准，未变则跳过 tarball 下载（tree sha 覆盖整棵目录——内容、文件名与权限位，只改附属脚本也无法隐藏，这正是过去只比 `SKILL.md` blob sha 的域所漏掉的）。任何一次成功扫描后都会记下新基准供下轮比对（每个重扫仓库一次请求；预检已经取到就复用）。内容全等的镜像仓库（按 per-skill `rev` 判定）由去重逻辑**墓碑化**，后续运行直接跳过，直到任一方有新推送再重新裁决。
-- **版本字段**：`scan` 为每个技能算出 `rev`（对目录内排序后的 `(path, git mode, blob sha)` 三元组取 sha256，发布为 `t1-<16 hex>`），`index` 连同 `firstSeenAt` 一起发布——即"首次记录到该 rev 的那一轮时间"，由 `cache/rev-ledger.jsonl` 求得。账本每个发布技能一行（不存历史），体积与索引同阶；本轮缺席的仓库其行**保留**，因为一次扫描失败不带任何信息，不该把整仓日期重置。
+- **版本字段**：`scan` 为每个技能算出 `rev`（对目录内排序后的 `(path, git mode, blob sha)` 三元组取 sha256，发布其前 16 位 hex），`index` 连同 `firstSeenAt` 一起发布——即"首次记录到该 rev 的那一轮时间"，由 `cache/rev-ledger.jsonl` 求得。账本每个发布技能一行（不存历史），体积与索引同阶；本轮缺席的仓库其行**保留**，因为一次扫描失败不带任何信息，不该把整仓日期重置。发布值刻意**不带算法标识**（消费方只把 `rev` 当等值判据，即便带上也无人解析），因此这份摘要是一份冻结契约：改动指纹域、规范化或哈希会改写全部发布值，属于破坏性变更——必须同轮 bump `SCHEMA_VERSION`（触发全量重建）与 `INDEX_FORMAT_VERSION`，并接受一次 `firstSeenAt` 重置。`tests/test_github_tarball.py` 钉住了固定输入的摘要值，无意的变动会在 CI 上失败。
 - **失败安全**：`update` 增量模式下，fetch 有失败页时**跳过**过期仓库清理（prune），避免把"恰好落在失败页上的仓库"误判为已消失。
 - **过滤**：流水线内置多层过滤（仓库级 / skill 级 / 合并级），完整规则见 [FILTERING.zh-CN.md](FILTERING.zh-CN.md)。
 - **最终索引** `index.jsonl` 的字段与消费方式见 [README.zh-CN.md](../README.zh-CN.md)。

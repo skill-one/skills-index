@@ -16,12 +16,12 @@ DAY1 = "2026-08-30T00:00:00Z"
 DAY2 = "2026-08-31T00:00:00Z"
 
 
-def _rec(source: str = "o/r", path: str = "skills/a", rev: str = "t1-aaa") -> dict:
+def _rec(source: str = "o/r", path: str = "skills/a", rev: str = "aaa") -> dict:
     return {"source": source, "path": path, "rev": rev, "skillId": path.rsplit("/", 1)[-1]}
 
 
 def _records() -> list[dict]:
-    return [_rec(), _rec(path="skills/b", rev="t1-bbb"), _rec(source="other/r", path="s/c")]
+    return [_rec(), _rec(path="skills/b", rev="bbb"), _rec(source="other/r", path="s/c")]
 
 
 def _stamp(records: list[dict], ledger: RevLedger, now: str) -> dict[str, str]:
@@ -61,7 +61,7 @@ def test_only_the_changed_skill_gets_a_new_date(tmp_path: Path) -> None:
     ledger.stamp(_records(), DAY1)
 
     changed = _records()
-    changed[1]["rev"] = "t1-bbb-edited"
+    changed[1]["rev"] = "bbb-edited"
     dates = _stamp(changed, ledger, DAY2)
 
     assert dates[("o/r", "skills/b")] == DAY2
@@ -98,10 +98,10 @@ def test_skill_removed_from_scanned_repo_drops_its_row(tmp_path: Path) -> None:
 def test_rev_rollback_resets_the_date(tmp_path: Path) -> None:
     """回滚到旧内容：账本只认「上一次记录的 rev」，日期按当前运行重记。"""
     ledger = RevLedger.load(tmp_path / "ledger.jsonl")
-    ledger.stamp([_rec(rev="t1-aaa")], DAY1)
-    ledger.stamp([_rec(rev="t1-new")], DAY2)
+    ledger.stamp([_rec(rev="aaa")], DAY1)
+    ledger.stamp([_rec(rev="new")], DAY2)
 
-    dates = _stamp([_rec(rev="t1-aaa")], ledger, DAY2)
+    dates = _stamp([_rec(rev="aaa")], ledger, DAY2)
 
     assert dates[("o/r", "skills/a")] == DAY2
 
@@ -133,10 +133,10 @@ def test_load_drops_malformed_rows(tmp_path: Path) -> None:
     """缺字段/坏行：忽略而非报错，等价于该技能没有历史。"""
     path = tmp_path / "ledger.jsonl"
     path.write_text(
-        '{"source":"o/r","path":"skills/a","rev":"t1-aaa","firstSeenAt":"2026-01-01T00:00:00Z"}\n'
+        '{"source":"o/r","path":"skills/a","rev":"aaa","firstSeenAt":"2026-01-01T00:00:00Z"}\n'
         '{"source":"o/r","path":"skills/no-rev","firstSeenAt":"2026-01-01T00:00:00Z"}\n'
-        '{"path":"skills/no-source","rev":"t1-bbb","firstSeenAt":"2026-01-01T00:00:00Z"}\n'
-        '{"source":"o/r","path":"skills/no-date","rev":"t1-ccc"}\n',
+        '{"path":"skills/no-source","rev":"bbb","firstSeenAt":"2026-01-01T00:00:00Z"}\n'
+        '{"source":"o/r","path":"skills/no-date","rev":"ccc"}\n',
         encoding="utf-8",
     )
 

@@ -153,6 +153,11 @@ SCANNED_FILE = "scanned.jsonl"
 META_FILE = "meta.json"
 
 # Bump when the scan output format changes so stale caches are rebuilt once.
+# v8: `rev` 去掉 `t1-` 算法前缀，发布值改为裸 16 位 hex（格式契约见下方
+#   REV_DIGEST_HEX）。指纹域/规范化/哈希本身未变，但缓存里存的 rev（
+#   scanned.jsonl 与 rev-ledger.jsonl）一律不再与新值相等，必须整体重建一次。
+#   该轮 index 会把每个技能判为「rev 已变」，firstSeenAt 随之重置一次——刻意
+#   如此：不做读侧前缀兼容，只保留一种格式。
 # v7: 指纹升级为「目录级内容指纹」——skillShas ({path: SKILL.md blob sha}) 换成
 #   skillRevs ({path: rev}，rev 覆盖技能目录内全部文件)，scanned.jsonl 每条技能
 #   新增 `rev` 字段。旧缓存既没有 rev 也带着过窄的预检域（附属文件变更会被
@@ -170,7 +175,7 @@ META_FILE = "meta.json"
 #   Pre-v5 caches are rebuilt once on the next scan.
 # v4: skill 级过滤（内部路径 + 非公开 frontmatter 标记）——v3 缓存的
 # scanned.jsonl 可能含非公开技能，需要重建。
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Fields kept from the skills.sh payload. No URL is persisted: consumers
 # reconstruct the GitHub directory URL from `source` + `path` (see README).
@@ -179,6 +184,10 @@ KEEP_FIELDS: set[str] = {"source", "skillId", "installs", "weeklyInstalls"}
 # Version of the published index format (index.jsonl + index-meta.json).
 # Bump when the record shape or field semantics change; consumers read it
 # from index-meta.json to detect incompatible snapshots.
+# v5: `rev` lost its `t1-` algorithm tag and is published as a bare 16-hex
+#   digest. Record shape is unchanged; every `rev` value changed, so consumers
+#   that stored old revs see one wholesale mismatch (they self-heal on the
+#   next update) and `firstSeenAt` resets once on the rebuild run.
 # v4: every record gained a per-skill content fingerprint `rev` (whole skill
 #   directory, see github.skill_rev) plus `firstSeenAt` (the UTC run that first
 #   recorded that rev, from the cross-run rev ledger). `rev` is the only
@@ -190,13 +199,18 @@ KEEP_FIELDS: set[str] = {"source", "skillId", "installs", "weeklyInstalls"}
 # v2: every record gained a repo-level `stars` field (stargazers_count of the
 #   skill's repository, fetched by the scan step); see index.run_index.
 # v1: initial format.
-INDEX_FORMAT_VERSION = 4
+INDEX_FORMAT_VERSION = 5
 
-# `rev` format: "<REV_ALGO_TAG>-<first REV_DIGEST_HEX hex chars of sha256>".
-# The tag is part of the published value on purpose: switching the digest
-# scheme (domain, normalization, hash) makes old and new fingerprints
-# incomparable, and consumers must be able to see that from the field itself.
-REV_ALGO_TAG = "t1"
+# `rev` format: the first REV_DIGEST_HEX hex chars of the sha256 over a skill
+# directory's canonical (path, git mode, blob sha) triples (github.skill_rev).
+# This is a frozen contract, not a versioned namespace: carrying an algorithm
+# tag in the value would buy nothing, because every consumer treats `rev` as an
+# opaque equality judge and would not parse it. So changing the domain, the
+# normalization or the hash is a breaking change by definition -- bump
+# SCHEMA_VERSION (one full rebuild) and INDEX_FORMAT_VERSION here, and accept
+# the one-time `firstSeenAt` reset plus the update wave it causes.
+# tests/test_core.py pins the digest of a fixed fixture, so an unintended
+# change fails CI instead of silently re-fingerprinting every skill.
 REV_DIGEST_HEX = 16  # 64 bits: collision-free at index scale (~24k skills)
 
 # A GitHub source is `owner/repo` (contains a slash, is not a full URL).

@@ -23,7 +23,6 @@ import yaml
 from .config import (
     HIDDEN_FRONTMATTER_MARKERS,
     JSON,
-    REV_ALGO_TAG,
     REV_DIGEST_HEX,
     is_internal_skill_path,
 )
@@ -95,7 +94,7 @@ def dir_owner(rel: str, dirs: Iterable[str]) -> str | None:
 
 
 def skill_rev(files: Iterable[SkillFile]) -> str:
-    """Content fingerprint of one skill directory: `"<tag>-<sha256[:n]>"`.
+    """Content fingerprint of one skill directory: `"<sha256[:n]>"`.
 
     The digest covers every file in the directory — `SKILL.md` plus scripts,
     templates and nested payload — over the canonicalized set of
@@ -108,10 +107,15 @@ def skill_rev(files: Iterable[SkillFile]) -> str:
     Paths are relative to the skill directory, so the same content at different
     paths — or in a fork or mirror of the repo — yields the same `rev`, which is
     what makes it usable as a cross-repo identity of one piece of content.
+
+    The published value carries no algorithm tag: consumers treat `rev` as an
+    opaque equality judge, so a tag would never be read. The domain, the
+    normalization and the hash are therefore frozen — see the format contract
+    at `config.REV_DIGEST_HEX` before changing any of them.
     """
     canon = json.dumps(sorted(files), ensure_ascii=False)
     digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()
-    return f"{REV_ALGO_TAG}-{digest[:REV_DIGEST_HEX]}"
+    return digest[:REV_DIGEST_HEX]
 
 
 def _scan_repo(  # noqa: E501
@@ -236,9 +240,10 @@ def _parse_tarball(  # noqa: E501
     but their bytes do enter the owning unit's `rev`, together with every other
     file under that unit's directory.
 
-    The tarball has a top-level `<repo>-<sha>/` directory, which is stripped so
-    paths are repo-relative (as used elsewhere); fingerprint entries are
-    relative to the owning skill directory (see `skill_rev`).
+    The tarball has a top-level `<repo>-<ref>/` directory (GitHub names archives
+    after the requested ref, not the commit), which is stripped so paths are
+    repo-relative (as used elsewhere); fingerprint entries are relative to the
+    owning skill directory (see `skill_rev`).
     """
     skill_members: dict[str, tarfile.TarInfo] = {}
     members: dict[str, tarfile.TarInfo] = {}

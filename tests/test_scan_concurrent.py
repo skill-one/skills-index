@@ -421,7 +421,7 @@ def test_scan_tree_precheck_mismatch_downloads_tarball(monkeypatch, tmp_path):
         f'"skillTreeShas": {{"skills/a": "tree-old"}}}}'
     )
     (repo_dir / config.SCANNED_FILE).write_text(
-        '{"path": "skills/a", "rev": "t1-old", "description": "old"}\n'
+        '{"path": "skills/a", "rev": "old", "description": "old"}\n'
     )
 
     monkeypatch.setattr(scan_mod, "SCANNED_REPOS", tmp_path / "scanned-repos.jsonl")
