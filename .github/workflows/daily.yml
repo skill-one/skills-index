@@ -2,18 +2,19 @@ name: daily-sync
 
 # Generate the skills index and publish the results as a GitHub Release.
 # Nothing is committed to the main branch (see .gitignore); each run is a
-# self-contained snapshot uploaded as a slim Release asset set:
-#   - index.jsonl / index-meta.json  the primary artifact + its metadata;
-#   - data.tar.gz   the whole published data/ tree (intermediate jsonl such as
-#                   fetched-skills.jsonl / scanned-repos.jsonl live here, not as
-#                   separate assets);
-#   - cache.tar.gz  per-repo incremental scan state (cache/by-source/ + rev
-#                   ledger), used solely to restore the next run's fingerprints;
-#   - run-summary.md the run report (also embedded in the Release body).
-# On main, index.jsonl + index-meta.json are additionally force-pushed to the
-# orphan `dist` branch BEFORE the Release is published (CDN/CORS path), so the
-# distCommit backfill lands in every copy and the Release and dist snapshots are
-# byte-identical.
+# self-contained snapshot published as two flat Release assets:
+#   - index.jsonl       the product;
+#   - index-meta.json   its metadata (formatVersion / generatedAt / counts / tag);
+# the run report is `update`'s stdout, captured into the runner's temp space
+# and attached as the Release body (no separate asset).
+# On main, index.jsonl + index-meta.json are force-pushed to the orphan `dist`
+# branch (CDN/CORS path) and the release tag is created ON the dist commit, so
+# the tag names an immutable snapshot addressable both as a Release download
+# and as a CDN URL (cdn.jsdelivr.net/gh/<repo>@<tag>/index.jsonl). The tag is
+# written into index-meta.json before anything is pushed, so no backfill pass
+# is needed and every copy is identical by construction.
+# The pipeline is fully stateless: `lastCommitAt` comes straight from git
+# history each run; nothing is carried between runs.
 #
 # Triggers:
 #   - Daily at 00:00 UTC (full refresh on `main`).
@@ -33,8 +34,8 @@ on:
       - test
   workflow_dispatch: {}
 
-# Only one run at a time: concurrent runs would race on the published Release
-# (cache restore, publish, prune) and corrupt the incremental chain.
+# Only one run at a time: concurrent runs would race on the dist push and
+# the release tag.
 concurrency:
   group: daily-sync
   cancel-in-progress: true
@@ -88,82 +89,47 @@ jobs:
       - name: Sync dependencies
         run: uv sync
 
-      - name: Decide fetch scope by branch
+      - name: Decide fetch scope and release tag
         id: scope
         run: |
           set -euo pipefail
           branch="${{ github.ref_name }}"
           echo "branch=$branch"
           if [ "$branch" = "test" ]; then
-            # Smoke test: fetch only 1 page.
-            echo "pages_arg=--pages 1" >> "$GITHUB_OUTPUT"
-            echo "tag_prefix=alpha-" >> "$GITHUB_OUTPUT"
+            # Smoke test: fetch only 1 page; prerelease, never `releases/latest`.
+            echo "pages=1" >> "$GITHUB_OUTPUT"
+            echo "tag=alpha-$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
           else
             # Full refresh on main (and any other branch): fetch all pages.
-            echo "pages_arg=" >> "$GITHUB_OUTPUT"
-            echo "tag_prefix=data-" >> "$GITHUB_OUTPUT"
-            # Repos with more than 500 skills are excluded (default cap).
-          fi
-          # Human-readable, lexicographically sortable UTC timestamp used for
-          # the release tag/name (e.g. 20260820T143015Z).
-          echo "ts=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
-
-      # Full refreshes (main) restore the previous run's per-repo incremental
-      # state (cache/by-source/) from the newest `data-` release so the scan
-      # can reuse pushed_at and skill-sha fingerprints. Smoke tests (test
-      # branch, --pages 1) skip this and go through the clean full-build path,
-      # leaving main's chain untouched.
-      - name: Restore incremental cache from latest data- release
-        if: steps.scope.outputs.pages_arg == ''
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # `latest` may point at a `test-` release, so resolve the newest
-          # `data-` prefixed release by creation time instead.
-          latest=$(gh release list --limit 100 --json tagName,createdAt \
-            --jq 'sort_by(.createdAt) | reverse | .[].tagName' \
-            | grep '^data-' | head -n 1 || true)
-          if [ -z "$latest" ]; then
-            echo "No previous data- release; running a full scan this time."
-            exit 0
-          fi
-          echo "Restoring incremental cache from release: $latest"
-          # Releases published before the cache/ split carry no cache.tar.gz;
-          # a missing asset (like a failed restore) just means a full scan.
-          if gh release download "$latest" --pattern cache.tar.gz; then
-            rm -rf cache
-            tar -xzf cache.tar.gz && rm -f cache.tar.gz
-            echo "Restored cache/by-source/ from $latest"
-          else
-            echo "No cache.tar.gz in $latest; running a full scan this time."
+            echo "pages=0" >> "$GITHUB_OUTPUT"
+            echo "tag=data-$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
           fi
 
       # GH_PAT (personal access token, 5000 req/h) is preferred over the
       # Actions GITHUB_TOKEN (1000 req/h per repo) to keep the meta phase fast;
-      # tarball downloads (SKILL.md content) are not billed to the quota at all.
+      # git clones (SKILL.md content, commit history) are not billed to the
+      # quota at all.
       - name: Fetch + scan + index
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_PAT: ${{ secrets.GH_PAT }}
-        run: uv run skills-index update ${{ steps.scope.outputs.pages_arg }}
+        run: |
+          set -euo pipefail
+          # The report goes to stdout; capture it as the future Release body.
+          uv run skills-index update \
+            --pages ${{ steps.scope.outputs.pages }} \
+            --tag ${{ steps.scope.outputs.tag }} \
+            > "$RUNNER_TEMP/run-summary.md"
+          cat "$RUNNER_TEMP/run-summary.md"
 
-      # Publish the CDN-accessible snapshot to the orphan `dist` branch FIRST,
-      # before packaging / publishing, so the distCommit backfill written into
-      # the workspace index-meta.json also flows into data.tar.gz and the
-      # Release asset. That is what keeps the Release and dist copies of
-      # index.jsonl / index-meta.json byte-identical: index.jsonl was always
-      # identical, but distCommit can only be recorded once the dist commit
-      # exists, so publishing the branch before the Release closes the gap.
-      #
-      # Single-snapshot orphan branch (force-pushed, no history accumulation):
-      # makes index.jsonl addressable as a normal git file so CORS-enabled CDN
-      # proxies (cdn.jsdelivr.net / cdn.jsdmirror.com /gh/...@dist/...) can
-      # serve it — release assets are not proxyable. index-meta.json rides
-      # along so CDN consumers can read generatedAt / formatVersion /
-      # distCommit. Main only, so smoke runs on `test` never overwrite the
-      # published index (and, with no dist commit to point at, their meta
-      # simply omits distCommit).
+      # Publish the CDN-accessible snapshot to the orphan `dist` branch: a
+      # flat, force-pushed branch carrying index.jsonl + index-meta.json, so
+      # CORS-enabled CDN proxies (cdn.jsdelivr.net /gh/...@<ref>/...) can serve
+      # them — release assets are not proxyable. Main only, so smoke runs on
+      # `test` never overwrite the published snapshot. Single commit: the tag
+      # was already written into the meta before this push, so there is no
+      # backfill pass and the dist and Release copies are identical by
+      # construction.
       - name: Publish index.jsonl to dist branch (CDN-accessible)
         if: github.ref_name == 'main'
         env:
@@ -174,79 +140,37 @@ jobs:
           git init -b dist
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # The dist branch keeps a flat layout so CDN URLs stay stable
-          # (.../gh/<repo>@dist/index.jsonl) regardless of the data/ tree.
-          cp "$GITHUB_WORKSPACE/data/index/index.jsonl" .
-          cp "$GITHUB_WORKSPACE/data/index/index-meta.json" .
+          # Flat layout so CDN URLs stay stable (.../gh/<repo>@<tag>/index.jsonl).
+          cp "$GITHUB_WORKSPACE/data/index.jsonl" .
+          cp "$GITHUB_WORKSPACE/data/index-meta.json" .
           git add index.jsonl index-meta.json
-          git commit -m "index snapshot ${{ steps.scope.outputs.ts }}"
+          git commit -m "index snapshot ${{ steps.scope.outputs.tag }}"
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push --force origin dist
-          # Backfill distCommit: the dist commit carrying this snapshot's
-          # index.jsonl only exists after the push, and consumers use it to
-          # fetch the jsonl from an immutable, commit-addressed URL
-          # (.../gh/<repo>@<sha>/index.jsonl) instead of the mutable `dist`
-          # ref. index.jsonl bytes are identical in both commits, so the
-          # recorded snapshot stays immutable. The backfilled meta is pushed
-          # as a second commit and, because this step runs before packaging /
-          # publishing, also lands in data.tar.gz and the Release asset via the
-          # workspace copy — so all three index-meta.json copies match.
-          dist_commit=$(git rev-parse HEAD)
-          jq --arg c "$dist_commit" '.distCommit = $c' index-meta.json > "$RUNNER_TEMP/meta.tmp"
-          cp "$RUNNER_TEMP/meta.tmp" "$GITHUB_WORKSPACE/data/index/index-meta.json"
-          cp "$RUNNER_TEMP/meta.tmp" index-meta.json
-          git add index-meta.json
-          git commit -m "meta: backfill distCommit"
-          git push --force origin dist
 
-      - name: Package data snapshot
-        run: |
-          tar -czf data.tar.gz data/
-          tar -czf cache.tar.gz cache/
-
-      - name: Build Release body from run summary
-        id: report
+      # The release tag is created ON the dist commit (main only): the tag
+      # then names an immutable snapshot for both URL schemes —
+      #   releases/download/<tag>/index.jsonl
+      #   cdn.jsdelivr.net/gh/<repo>@<tag>/index.jsonl   (CDN caches tags
+      #     permanently, like commit shas)
+      # The run report (captured from `update` stdout into the runner's temp
+      # space) is the Release body — it is not uploaded as a separate asset.
+      - name: Publish Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.scope.outputs.tag }}
         run: |
           set -euo pipefail
-          {
-            echo "body<<REPORT_EOF"
-            cat data/run-summary.md
-            echo "REPORT_EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Publish Release
-        uses: softprops/action-gh-release@v2
-        with:
-          # `<prefix>-<UTC timestamp>` so releases are human-readable and sort
-          # chronologically by tag (e.g. data-20260820T143015Z).
-          tag_name: ${{ steps.scope.outputs.tag_prefix }}${{ steps.scope.outputs.ts }}
-          name: "${{ steps.scope.outputs.tag_prefix }}${{ steps.scope.outputs.ts }}"
-          # Smoke (alpha-) releases are marked prerelease so GitHub's
-          # `releases/latest` — and README's latest/download path — always
-          # resolves to a full `data-` snapshot, never a 1-page smoke run.
-          prerelease: ${{ steps.scope.outputs.tag_prefix == 'alpha-' }}
-          body: |
-            Automated skills index snapshot.
-            Branch: `${{ github.ref_name }}`
-            Scope: ${{ github.ref_name == 'test' && 'smoke test (1 page)' || 'full refresh (all pages)' }}
-            Generated at ${{ steps.scope.outputs.ts }} (UTC).
-
-            ${{ steps.report.outputs.body }}
-          # Slim, human-facing asset set. Names are flat basenames (data/ and
-          # cache/ prefixes stripped), so releases/download/<tag>/<file> URLs
-          # stay stable regardless of the in-repo layout:
-          #   - index.jsonl + index-meta.json: the primary artifact and its
-          #     metadata, byte-identical to the `dist` branch copy;
-          #   - data.tar.gz: the whole published data/ tree (fetched-skills.jsonl
-          #     and github/scanned-repos.jsonl live here, no longer flattened);
-          #   - cache.tar.gz: incremental state for the next run only;
-          #   - run-summary.md: this report.
-          files: |
-            data.tar.gz
-            cache.tar.gz
-            data/index/index.jsonl
-            data/index/index-meta.json
-            data/run-summary.md
+          args=(--title "$TAG" --notes-file "$RUNNER_TEMP/run-summary.md")
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            args+=(--target dist)
+          else
+            # Smoke: prerelease so `releases/latest` always means a full run.
+            args+=(--prerelease --target main)
+          fi
+          gh release create "$TAG" "${args[@]}" \
+            data/index.jsonl \
+            data/index-meta.json
 
       # Prune only on main, so test smoke runs don't consume the retention quota.
       - name: Prune old releases
@@ -254,19 +178,18 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KEEP: ${{ env.KEEP_RELEASES }}
-          PREFIX: ${{ steps.scope.outputs.tag_prefix }}
         run: |
           set -euo pipefail
-          # Prune only this prefix's releases (keep test- smoke runs untouched).
+          # Prune only data- releases (keep alpha- smoke runs untouched).
           mapfile -t RELEASES < <(gh release list --limit 1000 --json tagName,createdAt \
-            --jq 'sort_by(.createdAt) | .[].tagName' | grep "^${PREFIX}")
+            --jq 'sort_by(.createdAt) | .[].tagName' | grep "^data-")
           total=${#RELEASES[@]}
           if [ "$total" -le "$KEEP" ]; then
             echo "Nothing to prune ($total <= $KEEP)."
             exit 0
           fi
           to_delete=$(( total - KEEP ))
-          echo "Pruning $to_delete oldest ${PREFIX} release(s) (keeping $KEEP)."
+          echo "Pruning $to_delete oldest data- release(s) (keeping $KEEP)."
           for (( i=0; i<to_delete; i++ )); do
             tag="${RELEASES[$i]}"
             echo "Deleting $tag"

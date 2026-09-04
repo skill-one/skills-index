@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -103,7 +104,8 @@ def get_json(client: httpx.Client, url: str) -> Any:
                 wait = rl_sleep or (2.0 * attempt)
                 print(
                     f"  [rate-limit {resp.status_code}] {url}: "
-                    f"sleeping {wait:.1f}s (attempt {attempt}/{RETRIES})"
+                    f"sleeping {wait:.1f}s (attempt {attempt}/{RETRIES})",
+                    file=sys.stderr,
                 )
                 time.sleep(wait)
                 last_err = httpx.HTTPStatusError(
@@ -127,7 +129,10 @@ def get_json(client: httpx.Client, url: str) -> Any:
                 raise HttpError(f"{status} on {url}", status=status) from exc
             last_err = exc
             wait = 2.0 * attempt
-            print(f"  [retry {attempt}/{RETRIES}] {url}: {exc}; sleeping {wait:.1f}s")
+            print(
+                f"  [retry {attempt}/{RETRIES}] {url}: {exc}; sleeping {wait:.1f}s",
+                file=sys.stderr,
+            )
             time.sleep(wait)
     raise HttpError(f"request failed after {RETRIES} retries: {url}") from last_err
 
@@ -182,7 +187,8 @@ def download_file(url: str, dest: Path, *, client: httpx.Client | None = None) -
                 last_err = exc
                 wait = 2.0 * attempt
                 print(
-                    f"  [retry {attempt}/{RETRIES}] {url}: {exc}; sleeping {wait:.1f}s"
+                    f"  [retry {attempt}/{RETRIES}] {url}: {exc}; sleeping {wait:.1f}s",
+                    file=sys.stderr,
                 )
                 time.sleep(wait)
             finally:

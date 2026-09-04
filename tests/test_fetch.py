@@ -62,7 +62,6 @@ def test_fetch_all_aborts_after_consecutive_failures(
     assert failed == [0, 1, 2]
     # Stopped before ever reaching page 3.
     assert requested == [0, 1, 2]
-    assert fetch.MAX_CONSECUTIVE_PAGE_FAILURES == 3
 
 
 def test_fetch_all_respects_max_pages(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -84,19 +83,24 @@ def test_fetch_all_respects_max_pages(monkeypatch: pytest.MonkeyPatch) -> None:
     assert requested == [0, 1]
 
 
-def test_distribute_by_source_creates_dirs_without_files(tmp_path) -> None:
-    """按 source 建目录（scan 以目录存在为增量键），但不落 per-dir 文件：
-    fetched 记录只存根目录 fetched-skills.jsonl，避免快照里重复一份。"""
-    skills = [
-        {"source": "a/b", "skillId": "x"},
-        {"source": "a/b", "skillId": "y"},
-        {"source": "c/d", "skillId": "z"},
-    ]
+def test_run_fetch_keeps_github_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_fetch filters to owner/repo sources and returns records in memory."""
+    monkeypatch.setattr(fetch, "POLITE_PAUSE", TEST_PAUSE)
 
-    dirs, total = fetch.distribute_by_source(skills, base_dir=tmp_path)
+    def fake_get_json(client: object, url: str) -> dict:
+        return {
+            "skills": [
+                {"source": "a/b", "skillId": "x"},
+                {"source": "https://example.com/a/b", "skillId": "y"},
+            ],
+            "hasMore": False,
+            "total": 2,
+        }
 
-    assert (dirs, total) == (2, 3)
-    assert (tmp_path / "a__b").is_dir()
-    assert (tmp_path / "c__d").is_dir()
-    # 目录内为空：不存在任何 fetched.jsonl 之类的 per-dir 副本。
-    assert list((tmp_path / "a__b").iterdir()) == []
+    monkeypatch.setattr(fetch, "get_json", fake_get_json)
+
+    skills, summary = fetch.run_fetch()
+
+    assert [s["skillId"] for s in skills] == ["x"]
+    assert summary["kept_github"] == 1
+    assert summary["dropped_non_github"] == 1

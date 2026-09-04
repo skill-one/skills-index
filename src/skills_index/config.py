@@ -10,244 +10,39 @@ from typing import Any
 # JSON payloads are dynamically shaped; we do not over-constrain them.
 JSON = Any
 
-# --- Paths (derived from this package location, no dependency on CWD) ---
-# Two disjoint trees with two distinct audiences:
-#
-#   data/  published artifacts only (bundled as data.tar.gz in every Release,
-#          consumed by data users): skills-sh/ (step 1 fetched rankings),
-#          github/ (step 2 per-repo summaries), index/ (step 3 merged index).
-#   cache/ incremental scan state (bundled separately as cache.tar.gz and
-#          restored only by the next CI run): by-source/<owner>__<repo>/
-#          fingerprints, see skills_index.cache.RepoCache.
-#
-# Consumers never download pipeline-internal state, and the cache layout can
-# evolve without touching published paths. File names are flat Release asset
-# names; renaming a file breaks consumer download URLs, moving one does not.
+# The pipeline is fully stateless: stages pass data in memory — there are no
+# intermediate files — and every run recomputes everything from the two
+# upstream sources. `lastCommitAt` comes straight from git history each run,
+# so there is no cross-run memory at all.
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 DATA_DIR = ROOT / "data"
-CACHE_DIR = ROOT / "cache"
 
-# Standalone `pull` helper: where a published snapshot is downloaded for a human
-# to inspect locally. Fully separate from the pipeline's data/ and cache/ trees,
-# never referenced by clean_workspace or the fetch/scan/index steps, and git
-# ignored. Each release lands in pulled/<tag>/data/ mirroring the published tree.
-PULLED_DIR = ROOT / "pulled"
+# The product
+INDEX_JSONL = DATA_DIR / "index.jsonl"
+INDEX_META_JSON = DATA_DIR / "index-meta.json"
 
-# Step 1: skills.sh content
-SKILLS_SH_DIR = DATA_DIR / "skills-sh"
-# fetched summary (skills.sh raw data, one record per skill)
-FETCHED_SKILLS = SKILLS_SH_DIR / "fetched-skills.jsonl"
-
-# Step 2: GitHub repo scan content
-GITHUB_DIR = DATA_DIR / "github"
-# scan summary: original scan order (one row per repo with pushedAt / stars /
-# skillCount / skill paths); written by the `scan` command
-SCANNED_REPOS = GITHUB_DIR / "scanned-repos.jsonl"
-
-# Step 3: merged final artifacts
-INDEX_DIR = DATA_DIR / "index"
-# final index (fetch + scan joined, one record per skill), by `index` command
-INDEX_JSONL = INDEX_DIR / "index.jsonl"
-# index.jsonl self-describing metadata (generatedAt / counts / formatVersion),
-# published with the Release and on the dist branch
-INDEX_META_JSON = INDEX_DIR / "index-meta.json"
-
-# Run report rendered by `update` and embedded in the Release body
-RUN_SUMMARY = DATA_DIR / "run-summary.md"
-
-# Everything under data/ that a run (re)generates; `clean_workspace` deletes
-# exactly these before a from-scratch rebuild.
-PUBLISHED_FILES: tuple[Path, ...] = (
-    FETCHED_SKILLS,
-    SCANNED_REPOS,
-    INDEX_JSONL,
-    INDEX_META_JSON,
-    RUN_SUMMARY,
-)
-
-# Per-repo incremental cache root: one <owner>__<repo>/ directory per scanned
-# repository (meta.json + scanned.jsonl), published as cache.tar.gz so the
-# next CI run can restore the incremental chain.
-BY_SOURCE_DIR = CACHE_DIR / "by-source"
-
-# Cross-run memory of what each published skill's content looked like last time
-# (one row per skill: current `rev` + the run that first recorded it). Lives at
-# the CACHE_DIR root rather than under by-source/, because `clean_workspace`
-# wipes only the per-repo tree and RepoCache purges only files inside a repo
-# dir — a root-level file therefore survives both, while still riding along in
-# cache.tar.gz (the whole cache/ tree is packaged and restored by CI).
-REV_LEDGER = CACHE_DIR / "rev-ledger.jsonl"
-
-# 仓库 skillCount 过滤上限：scan 与 index 均会丢弃 skillCount > MAX_SKILL_COUNT
-# 的仓库（例如聚合型 / awesome-list 类仓库会捆绑过量技能，稀释索引质量）。
-# 设为 0 可关闭该上限。
-MAX_SKILL_COUNT = 500
-
-# Skill 级过滤（scan 阶段）之一：结构性内部目录。SKILL.md 所在路径的任一
-# 非文件名目录段命中以下目录则视为非公开技能（测试 / 示例 / 构建产物等），
-# 不写入 scanned.jsonl。只匹配中间目录段、整段精确比较且大小写不敏感，
-# 因此名为 test / template / e2e 的真实技能（最后一段是技能自身目录名）
-# 不会被误伤。
-SKILL_EXCLUDE_DIRS: frozenset[str] = frozenset({
-    "test", "tests", "__tests__", "spec", "e2e",
-    "example", "examples", "sample", "samples", "demo", "demos",
-    "fixture", "fixtures", "mock", "mocks", "stub", "stubs",
-    "template", "templates", "scaffold", "boilerplate",
-    "doc", "docs",
-    "dist", "build", "out", "node_modules", "vendor", "third_party",
-})
-
-# Skill 级过滤之二：状态词（与 HIDDEN_FRONTMATTER_MARKERS 语义对齐）。
-# 任一路径段命中即排除，含技能自身目录名——目录或技能名本身为
-# deprecated / hidden / private 等即宣示非公开（如 skills/deprecated/foo
-# 或名为 hidden 的技能）；现实中不存在恰好以这些词命名的公开技能
-# （数据回放零命中，纯预防性规则）。
-SKILL_EXCLUDE_ANY_DIRS: frozenset[str] = frozenset({
-    "deprecated", "hidden", "private", "internal", "obsolete",
-})
-
-# 隐藏目录段（如 .github / .devcontainer）默认视为仓库配置而排除；但紧跟
-# skills 段的隐藏根（.claude/skills、.agents/skills 等各 agent 工具的公开
-# 技能标准位置）以及 .skills 根本身保留（见 is_internal_skill_path）。
-# .github 恒为仓库配置，即使形如 .github/skills 也不算公开。
-
-# frontmatter 中标记技能为非公开的字段（值为真即排除，如 true / yes / 1）。
-# 识别生态常见别名，不发明新标准；另支持 public: false。
-HIDDEN_FRONTMATTER_MARKERS: tuple[str, ...] = (
-    "deprecated", "hidden", "private", "internal", "obsolete",
-)
-
-
-def is_internal_skill_path(rel: str) -> bool:
-    """True if a SKILL.md lives in a repo-internal (non user-facing) directory."""
-    segs = rel.split("/")
-    for seg in segs:  # 状态词匹配任意段，含技能自身目录名
-        if seg.lower() in SKILL_EXCLUDE_ANY_DIRS:
-            return True
-    for i, seg in enumerate(segs[:-1]):  # 结构词只看中间目录段，不含技能名
-        low = seg.lower()
-        if low in SKILL_EXCLUDE_DIRS:
-            return True
-        if seg.startswith("."):
-            next_low = segs[i + 1].lower()
-            public_root = (next_low == "skills" or low == ".skills") and low != ".github"
-            if not public_root:
-                return True
-    return False
-
-# --- External endpoints ---
+#--- External endpoints ---
 SKILLS_API = "https://skills.sh/api/skills/all-time"
 GITHUB_API = "https://api.github.com"
 
-# Default target of the standalone `pull` helper: this project's own public
-# repo, whose latest `data-` release carries the full published snapshot.
-# Overridable per run via `pull --repo owner/repo`.
-GITHUB_REPO = "skill-one/skills-index"
-# Release asset bundling the published data/ tree (see daily.yml). This is what
-# `pull` downloads so a human can inspect exactly what CI published.
-DATA_ASSET = "data.tar.gz"
-
-# --- File names produced per repository under data/by-source/<owner>__<repo>/ ---
-SCANNED_FILE = "scanned.jsonl"
-META_FILE = "meta.json"
-
-# Bump when the scan output format changes so stale caches are rebuilt once.
-# v8: `rev` 去掉 `t1-` 算法前缀，发布值改为裸 16 位 hex（格式契约见下方
-#   REV_DIGEST_HEX）。指纹域/规范化/哈希本身未变，但缓存里存的 rev（
-#   scanned.jsonl 与 rev-ledger.jsonl）一律不再与新值相等，必须整体重建一次。
-#   该轮 index 会把每个技能判为「rev 已变」，firstSeenAt 随之重置一次——刻意
-#   如此：不做读侧前缀兼容，只保留一种格式。
-# v7: 指纹升级为「目录级内容指纹」——skillShas ({path: SKILL.md blob sha}) 换成
-#   skillRevs ({path: rev}，rev 覆盖技能目录内全部文件)，scanned.jsonl 每条技能
-#   新增 `rev` 字段。旧缓存既没有 rev 也带着过窄的预检域（附属文件变更会被
-#   误判为「技能未变」而跳过 tarball），必须整体重建一次。
-# v6: 收录域收紧，需一次性重建：
-#   1) SKILL.md 有效性判定——frontmatter 必须含非空的 name + description
-#      （agent skills 规范必备字段，见 github.is_invalid_frontmatter），否则
-#      视为无效文件而非公开技能；
-#   2) 嵌套 payload——技能目录是自包含单元，其子树里的 SKILL.md 是该单元的
-#      payload 而非独立候选（见 github._outermost_skill_dirs），skillShas
-#      指纹域随之缩小。v5 缓存的 scanned.jsonl 可能收录了此类技能。
-# v5: cache split out of data/ (cache/by-source/), meta.json restructured as a
-#   tagged record (`status` = ok / filtered / tombstoned) with the fingerprint
-#   renamed to `skillShas` ({path: sha} of the repo's public SKILL.md files).
-#   Pre-v5 caches are rebuilt once on the next scan.
-# v4: skill 级过滤（内部路径 + 非公开 frontmatter 标记）——v3 缓存的
-# scanned.jsonl 可能含非公开技能，需要重建。
-SCHEMA_VERSION = 8
-
-# Fields kept from the skills.sh payload. No URL is persisted: consumers
-# reconstruct the GitHub directory URL from `source` + `path` (see README).
-KEEP_FIELDS: set[str] = {"source", "skillId", "installs", "weeklyInstalls"}
-
 # Version of the published index format (index.jsonl + index-meta.json).
-# Bump when the record shape or field semantics change; consumers read it
-# from index-meta.json to detect incompatible snapshots.
-# v5: `rev` lost its `t1-` algorithm tag and is published as a bare 16-hex
-#   digest. Record shape is unchanged; every `rev` value changed, so consumers
-#   that stored old revs see one wholesale mismatch (they self-heal on the
-#   next update) and `firstSeenAt` resets once on the rebuild run.
-# v4: every record gained a per-skill content fingerprint `rev` (whole skill
-#   directory, see github.skill_rev) plus `firstSeenAt` (the UTC run that first
-#   recorded that rev, from the cross-run rev ledger). `rev` is the only
-#   equality judge; `firstSeenAt` is display-only and never orders anything.
-# v3: index-meta.json slimmed to {formatVersion, generatedAt, counts.total}
-#   and gained `distCommit` (backfilled by CI after the dist force-push);
-#   static schema notes (weeklyInstalls semantics, stars scope) moved to the
-#   README field tables.
-# v2: every record gained a repo-level `stars` field (stargazers_count of the
-#   skill's repository, fetched by the scan step); see index.run_index.
-# v1: initial format.
-INDEX_FORMAT_VERSION = 5
-
-# `rev` format: the first REV_DIGEST_HEX hex chars of the sha256 over a skill
-# directory's canonical (path, git mode, blob sha) triples (github.skill_rev).
-# This is a frozen contract, not a versioned namespace: carrying an algorithm
-# tag in the value would buy nothing, because every consumer treats `rev` as an
-# opaque equality judge and would not parse it. So changing the domain, the
-# normalization or the hash is a breaking change by definition -- bump
-# SCHEMA_VERSION (one full rebuild) and INDEX_FORMAT_VERSION here, and accept
-# the one-time `firstSeenAt` reset plus the update wave it causes.
-# tests/test_core.py pins the digest of a fixed fixture, so an unintended
-# change fails CI instead of silently re-fingerprinting every skill.
-REV_DIGEST_HEX = 16  # 64 bits: collision-free at index scale (~24k skills)
+# v7: rebuilt around skills.sh as the sole registry — only registered skills
+#   are indexed (no scan-only entries) and every record carries all fields.
+#   index-meta.json swapped `distCommit` for `tag` (the release tag, which
+#   names the dist-branch commit carrying this snapshot and addresses both
+#   the Release-download and CDN URLs).
+# v8: dropped `name` / `isOfficial` from published records (name duplicates
+#   skillId; isOfficial flags nothing actionable).
+# v9: scan switched from codeload tarball to one bare partial git clone per
+#   repo; `rev` (content fingerprint) removed; `firstSeenAt` (run stamp,
+#   inherited from the previous published index) replaced by `lastCommitAt`
+#   — the skill directory's true most-recent commit time, straight from
+#   `git log` each run. The pipeline is fully stateless again.
+INDEX_FORMAT_VERSION = 9
 
 # A GitHub source is `owner/repo` (contains a slash, is not a full URL).
 GITHUB_SOURCE = re.compile(r"^[^/\s]+/[^/\s]+$")
-
-# Directory separator replacement. The mapping is reversible: `dir_to_source`
-# splits on the FIRST separator, so repo names containing `__` round-trip
-# correctly (`owner/my__repo` <-> `owner__my__repo`). GitHub owner names cannot
-# contain underscores at all, so the first separator is always the real one.
-DIR_SEP = "__"
-
-
-def source_to_dir(source: str) -> str:
-    """Map `owner/repo` to a flat, reversible directory name `owner__repo`."""
-    return source.replace("/", DIR_SEP)
-
-
-def dir_to_source(dir_name: str) -> str:
-    """Inverse of :func:`source_to_dir` (only the first separator is split)."""
-    return dir_name.replace(DIR_SEP, "/", 1)
-
-
-def iter_repo_dirs(base_dir: Path) -> list[str]:
-    """Return sorted repo dir names under `base_dir` (any name with ``DIR_SEP``).
-
-    `source_to_dir` maps `owner/repo` -> `owner__repo`; `dir_to_source` splits
-    on the first separator, so the mapping stays reversible even for repo
-    names containing `__` — those must not be silently skipped. Dirs without
-    a separator are unrelated files and are ignored.
-    """
-    if not base_dir.exists():
-        return []
-    return sorted(
-        d.name
-        for d in base_dir.iterdir()
-        if d.is_dir() and DIR_SEP in d.name
-    )
 
 
 def is_github_source(source: str) -> bool:

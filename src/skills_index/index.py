@@ -1,25 +1,12 @@
-"""Merge scanned GitHub skills (baseline) with skills.sh metadata into index.jsonl."""
+"""Join skills.sh data (identity, popularity) with GitHub enrichment into index.jsonl."""
 
 from __future__ import annotations
 
 import datetime
-from pathlib import Path
+import sys
 
-from .cache import RepoCache, RevLedger
-from .config import (
-    BY_SOURCE_DIR,
-    FETCHED_SKILLS,
-    INDEX_FORMAT_VERSION,
-    INDEX_JSONL,
-    INDEX_META_JSON,
-    JSON,
-    REV_LEDGER,
-    SCANNED_FILE,
-    Record,
-    dir_to_source,
-    iter_repo_dirs,
-)
-from .io_utils import read_jsonl, write_json, write_jsonl
+from .config import INDEX_FORMAT_VERSION, INDEX_JSONL, INDEX_META_JSON, JSON, Record
+from .io_utils import write_json, write_jsonl
 
 # Column order for the emitted index.jsonl records.
 _INDEX_FIELD_ORDER = (
@@ -30,23 +17,21 @@ _INDEX_FIELD_ORDER = (
     "installs",
     "weeklyInstalls",
     "path",
-    "rev",
-    "firstSeenAt",
+    "lastCommitAt",
 )
+
+# skills.sh fields carried by `fetch` in memory but never published.
+_INDEX_UNPUBLISHED = ("name", "isOfficial")
 
 
 def _ordered(rec: Record) -> Record:
-    """Return `rec` with keys ordered for index.jsonl output.
-
-    Known fields come first in a stable order; any remaining keys are appended
-    in their original (insertion) order.
-    """
+    """Return `rec` with keys ordered for index.jsonl output."""
     out: Record = {}
     for k in _INDEX_FIELD_ORDER:
         if k in rec:
             out[k] = rec[k]
     for k, v in rec.items():
-        if k not in out:
+        if k not in out and k not in _INDEX_UNPUBLISHED:
             out[k] = v
     return out
 
@@ -54,10 +39,9 @@ def _ordered(rec: Record) -> Record:
 def _dedup_skills(records: list[Record]) -> tuple[list[Record], int]:
     """Drop cross-repo duplicates: same skillId + same non-empty description.
 
-    skillId 是技能目录名（非全局唯一，同名不同实现的技能真实存在），单独
-    相同不足以判定重复；叠加 frontmatter description 完全一致才视为同一
-    技能的镜像/拷贝，保留 installs 更高者（fetch 顺序破平局，即 skills.sh
-    排名靠前者）。description 为空的记录不参与去重：未知不等于相同。
+    skillId 单独相同不足以判定重复（同名不同实现真实存在）；叠加
+    description 完全一致才视为同一技能的镜像，保留 installs 更高者（记录
+    顺序破平局，即 skills.sh 排名靠前者）。description 为空不参与去重。
     Returns ``(kept, dropped_count)``.
     """
     groups: dict[tuple[str, str], list[int]] = {}
@@ -77,148 +61,74 @@ def _dedup_skills(records: list[Record]) -> tuple[list[Record], int]:
     return [r for i, r in enumerate(records) if i not in drop], len(drop)
 
 
-def _filled(rec: Record) -> Record:
-    """installs / weeklyInstalls 缺失时填 0 / []，保证每条记录形状统一。"""
-    rec.setdefault("installs", 0)
-    rec.setdefault("weeklyInstalls", [])
-    return rec
-
-
-def _strip_metadata(rec: Record) -> Record:
-    """scan-only 技能无 skills.sh 数据：installs / weeklyInstalls 字段不出现。"""
-    rec.pop("installs", None)
-    rec.pop("weeklyInstalls", None)
-    return rec
+def _key(rec: Record) -> tuple[str, str]:
+    return (str(rec.get("source", "")), str(rec.get("skillId", "")))
 
 
 def run_index(
-    base_dir: Path = BY_SOURCE_DIR, *, now: str | None = None
+    fetched: list[Record],
+    scanned: list[JSON],
+    *,
+    now: str | None = None,
+    tag: str = "",
 ) -> tuple[list[Record], dict[str, JSON]]:
-    """Merge every repo's scanned skills with skills.sh metadata into index.jsonl.
+    """Merge fetched + scanned data into index.jsonl.
 
-    - each repo's `scanned.jsonl` is the baseline: every scanned skill is
-      written to index.jsonl.
-    - the repo's cache meta.json provides the repo-level `stars` count
-      (fetched by the scan step from the GitHub repo metadata), attached to
-      every skill of that repo.
-    - `fetched-skills.jsonl` provides the skills.sh metadata (installs /
-      weeklyInstalls), joined on `source` + `skillId`. Scanned skills with no
-      fetched counterpart ("scan-only", e.g. not registered on skills.sh) keep
-      the installs / weeklyInstalls fields absent.
-    - fetched skills with no scanned counterpart (removed from the repo) are
-      dropped: only skills a repo scan confirms belong in the index.
-    - output order: skills with fetched data keep the skills.sh ranking order;
-      scan-only skills are appended at the end.
-    - every skill carries the `rev` its scan computed, plus `firstSeenAt`: the
-      run that first recorded that rev, resolved through the cross-run ledger
-      (see :class:`RevLedger`). Nothing else can tell two skills of the same
-      name apart, and `firstSeenAt` only moves when content does.
+    - join on (source, skillId): skills.sh supplies identity and popularity,
+      the scan supplies path / description / lastCommitAt / stars;
+    - fetched skills with no located counterpart are dropped: the repo no
+      longer confirms them (definitive evidence only);
+    - records keep the skills.sh ranking order; cross-repo duplicates (same
+      skillId + same non-empty description) keep only the highest-installs
+      copy;
+    - `lastCommitAt` is factual data taken verbatim from the scan (the
+      skill directory's most recent commit time), never stamped by the run.
 
-    `now` (second-precision UTC) is injectable so stamped dates are testable
-    without waiting on a clock. Returns ``(index_records, summary)`` where
-    ``summary`` holds counts for the run report.
+    `now` (index-meta.json `generatedAt`) and `tag` (the release tag
+    recorded in index-meta.json) are injectable for testability.
+    Returns ``(index_records, summary)``.
     """
     now = now or datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    # Index only merges skills whose repo was scanned in step 2. Step 2
-    # tombstones repos above the skillCount cap (config.MAX_SKILL_COUNT),
-    # removing their scanned.jsonl, so those repos never reach this step.
-    fetched_list = read_jsonl(FETCHED_SKILLS)
-    fetched: dict[tuple[str, str], Record] = {}
+    fetched_by_key: dict[tuple[str, str], Record] = {}
     rank: dict[tuple[str, str], int] = {}
-    for i, r in enumerate(fetched_list):
-        k = _key(r)
-        if k not in fetched:
-            fetched[k] = r
+    for i, rec in enumerate(fetched):
+        k = _key(rec)
+        if k not in fetched_by_key:
+            fetched_by_key[k] = rec
             rank[k] = i
-    if not fetched:
-        print(f"[index] no fetched data at {FETCHED_SKILLS}; installs will be empty")
-    summary: dict[str, JSON] = {
-        "fetched": len(fetched),
-        "scanned_merged": 0,
-        "scan_only": 0,
-        "not_in_repo": 0,
-        "deduped_skills": 0,
-        "rev_refreshed": 0,
-        "ledger_total": 0,
-        "index": 0,
-    }
 
     matched: list[tuple[int, Record]] = []
-    scan_only: list[Record] = []
-    matched_keys: set[tuple[str, str]] = set()
-
-    subdirs = iter_repo_dirs(base_dir)
-    for dir_name in subdirs:
-        source = dir_to_source(dir_name)
-        gh_path = base_dir / dir_name / SCANNED_FILE
-        # Repo-level stars come from the same scan run that wrote
-        # scanned.jsonl (cache contract: scanned.jsonl only exists for
-        # "ok"-status metas, which always carry `stars`); 0 covers a missing
-        # or pre-stars legacy meta, e.g. when index runs against a stale cache.
-        cache = RepoCache.load(base_dir / dir_name, source)
-        stars = int(cache.meta.get("stars") or 0)
-        for rec in read_jsonl(gh_path):
-            skill_id = Path(str(rec.get("path", ""))).name
-            key = (source, skill_id)
-            base = fetched.get(key)
-            if base is None:
-                # GitHub repo contains a SKILL.md not registered on skills.sh:
-                # still indexed, with empty skills.sh metadata.
-                scan_only.append({"source": source, "skillId": skill_id, "stars": stars, **rec})
-                continue
-            matched.append((rank[key], {**base, **rec, "stars": stars}))
-            matched_keys.add(key)
-
-    # Skills with fetched data keep the skills.sh ranking order; scan-only
-    # skills are appended afterwards (repo-dir order, path order within repo).
+    for rec in scanned:
+        k = _key(rec)
+        base = fetched_by_key.get(k)
+        if base is not None:  # defensive: the scan only locates fetched skills
+            matched.append((rank[k], {**base, **rec}))
     matched.sort(key=lambda t: t[0])
-    result = [_ordered(_filled(rec)) for _, rec in matched]
-    result += [_ordered(_strip_metadata(rec)) for rec in scan_only]
-    # 跨仓库重复（skillId + description 双匹配）只保留 installs 更高者。
+    result = [_ordered(rec) for _, rec in matched]
+
     result, deduped = _dedup_skills(result)
-    # Stamped after dedup so the ledger records exactly what gets published: a
-    # skill dropped as a mirror must not hold a row that would resurface its
-    # date if it ever wins again.
-    ledger = RevLedger.load(REV_LEDGER)
-    refreshed, ledger_total = ledger.stamp(result, now)
+
+    meta: dict[str, JSON] = {
+        "formatVersion": INDEX_FORMAT_VERSION,
+        "generatedAt": now,
+        "counts": {"total": len(result)},
+    }
+    if tag:
+        meta["tag"] = tag
     write_jsonl(INDEX_JSONL, result)
-    ledger.save(REV_LEDGER)
+    write_json(INDEX_META_JSON, meta)
 
-    # Self-describing metadata for consumers: absolute generation time, the
-    # total record count, and a format version to detect incompatible
-    # snapshots without parsing every record. Kept deliberately minimal:
-    # static schema notes (weeklyInstalls order/window, stars scope) live in
-    # the README field tables, not in every published snapshot.
-    # `distCommit` is NOT written here: the dist-branch commit that carries
-    # this snapshot's index.jsonl only exists after CI force-pushes dist, so
-    # CI backfills it into both the dist copy and the workspace copy (and
-    # thus the Release asset) right after the push.
-    write_json(
-        INDEX_META_JSON,
-        {
-            "formatVersion": INDEX_FORMAT_VERSION,
-            "generatedAt": now,
-            "counts": {"total": len(result)},
-        },
+    summary: dict[str, JSON] = {
+        "fetched": len(fetched),
+        "confirmed": len(matched),
+        "not_in_repo": len(fetched) - len(matched),
+        "deduped": deduped,
+        "index": len(result),
+    }
+    print(
+        f"[index] {len(matched)} confirmed, dropped {summary['not_in_repo']} "
+        f"not-in-repo, deduped {deduped} cross-repo "
+        f"-> {len(result)} in {INDEX_JSONL}",
+        file=sys.stderr,
     )
-    summary["scanned_merged"] = len(matched)
-    summary["scan_only"] = len(scan_only)
-    summary["not_in_repo"] = len(fetched) - len(matched_keys)
-    summary["deduped_skills"] = deduped
-    summary["rev_refreshed"] = refreshed
-    summary["ledger_total"] = ledger_total
-    summary["index"] = len(result)
-    msg = (
-        f"[index] merged {len(matched)} scanned with skills.sh data, "
-        f"{len(scan_only)} scan-only (no installs data), "
-        f"dropped {summary['not_in_repo']} not-in-repo"
-        + (f", deduped {deduped} cross-repo" if deduped else "")
-        + f", rev refreshed for {refreshed}/{len(result)}"
-        + f" -> {len(result)} in {INDEX_JSONL}"
-    )
-    print(msg)
     return result, summary
-
-
-def _key(rec: Record) -> tuple[str, str]:
-    return (str(rec.get("source", "")), str(rec.get("skillId", "")))

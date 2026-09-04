@@ -1,6 +1,6 @@
 # Skills Index
 
-这个项目是为 Skills (存在 github) 提供一个索引, 方便其他用户更容易的获取所有的 skills 的元信息 (source/skillId/name/installs/weeklyInstalls/url 等)
+这个项目是为 Skills (存在 github) 提供一个索引, 方便其他用户更容易的获取所有的 skills 的元信息 (source/skillId/installs/weeklyInstalls/description 等)
 
 # 要求
 
@@ -14,3 +14,4 @@
 # 项目要求
 
 1. 基于 python + uv, 添加类型注释
+

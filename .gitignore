@@ -12,6 +12,3 @@ htmlcov/
 
 # Generated dataset (published via GitHub Releases, not committed)
 data/
-cache/
-# Local inspection area for `skills-index pull` (downloaded published snapshots)
-pulled/
